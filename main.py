@@ -5,9 +5,13 @@ Modos disponibles:
 2 - Triangulación manual por click (click izquierda -> click derecha)
 3 - Mapa de disparidad en tiempo real (SGBM)
 4 - Reconocimiento de gestos (MediaPipe)
+5 - Detección automática de cajas con YOLOv8-seg
+6 - Entrenar YOLOv8-seg con el dataset de Roboflow
+7 - Guardar una captura ZED para pre-etiquetado
 
 Controles:
-- Teclas 1/2/3/4: cambiar modo
+- Teclas 1/2/3/4/5/6: cambiar modo
+- Tecla 7: guardar captura de la lente izquierda en images_pre_labeled/
 - q: salir
 - r: limpiar puntos seleccionados (modo 2)
 """
@@ -15,6 +19,7 @@ Controles:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
@@ -22,7 +27,9 @@ import numpy as np
 
 from modules.camera_module import ZEDCamera
 from modules.gesture_module import GestureRecognizer
+from modules.prelabel_capture_module import PrelabelCaptureModule
 from modules.stereo_module import StereoTriangulator
+from modules.yolo_stereo_module import YoloSegBoxModule
 
 
 class StereoInteractiveApp:
@@ -40,10 +47,16 @@ class StereoInteractiveApp:
     MODE_TRIANGULATION = 2
     MODE_DISPARITY = 3
     MODE_GESTURES = 4
+    MODE_YOLO_BOXES = 5
 
     def __init__(self) -> None:
         base_dir = os.path.dirname(__file__)
         calib_path = os.path.join(base_dir, "calibration", "stereo_calib.npz")
+        dataset_yaml = os.path.join(
+            base_dir,
+            "Etiquetado_Cajas_V3D.v2-dataset_2_clases_cajas.yolov8",
+            "data.yaml",
+        )
 
         if not os.path.exists(calib_path):
             raise FileNotFoundError(f"Fichero de calibración no encontrado: {calib_path}")
@@ -52,6 +65,14 @@ class StereoInteractiveApp:
         self.camera = ZEDCamera()
         self.stereo = StereoTriangulator(calib_path=calib_path, image_size=(1280, 720))
         self.gesture: Optional[GestureRecognizer] = None
+        self.yolo: Optional[YoloSegBoxModule] = None
+        self.prelabel_capture: Optional[PrelabelCaptureModule] = None
+        self.yolo_dataset_yaml = dataset_yaml
+        self.yolo_project_dir = Path(base_dir) / "runs" / "yolo_boxes"
+        self.yolo_weights = self.yolo_project_dir / "boxes_seg" / "weights" / "best.pt"
+        self.prelabel_output_dir = Path(base_dir) / "images_pre_labeled"
+        # Por defecto guardamos solo la vista izquierda; cambia esto a True si quieres ambos ojos.
+        self.prelabel_save_both_views = False
 
         # Estado del modo y ventanas
         self.mode = self.MODE_RAW
@@ -63,6 +84,47 @@ class StereoInteractiveApp:
         self.left_click: Optional[Tuple[int, int]] = None
         self.right_click: Optional[Tuple[int, int]] = None
         self.last_3d: Optional[np.ndarray] = None
+
+    def _ensure_yolo(self) -> YoloSegBoxModule:
+        if self.yolo is None:
+            self.yolo = YoloSegBoxModule(
+                dataset_yaml=self.yolo_dataset_yaml,
+                project_dir=self.yolo_project_dir,
+                custom_weights=self.yolo_weights,
+            )
+            self.yolo.load_trained_model()
+        return self.yolo
+
+    def _train_yolo(self) -> None:
+        # Entrena el detector custom y deja el checkpoint listo para el modo 5.
+        self.yolo = YoloSegBoxModule(
+            dataset_yaml=self.yolo_dataset_yaml,
+            project_dir=self.yolo_project_dir,
+        )
+        print("Iniciando entrenamiento YOLOv8-seg con el dataset de Roboflow...")
+        self.yolo.train_model()
+        self.yolo_weights = self.yolo_project_dir / "boxes_seg" / "weights" / "best.pt"
+        print(f"Entrenamiento terminado. Checkpoint listo en: {self.yolo_weights}")
+
+    def _ensure_prelabel_capture(self) -> PrelabelCaptureModule:
+        if self.prelabel_capture is None:
+            self.prelabel_capture = PrelabelCaptureModule(
+                output_root=self.prelabel_output_dir,
+                save_both_views=self.prelabel_save_both_views,
+            )
+        return self.prelabel_capture
+
+    def _capture_prelabeled(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
+        capturer = self._ensure_prelabel_capture()
+        saved_paths = capturer.capture(frame_left, frame_right)
+
+        if "right" in saved_paths:
+            print(
+                "Captura guardada para pre-etiquetado: "
+                f"izquierda={saved_paths['left']} | derecha={saved_paths['right']}"
+            )
+        else:
+            print(f"Captura guardada para pre-etiquetado: {saved_paths['left']}")
 
     def _init_windows(self) -> None:
         # Crear ventanas y asociar callbacks de ratón para seleccionar puntos
@@ -123,9 +185,9 @@ class StereoInteractiveApp:
         # Modo inicial: mostrar las imágenes tal cual llegan de la cámara
         left_view = self._draw_header(
             frame_left,
-            "Modo crudo: pulsa 1 rectificar | 2 triangular | 3 disparidad | 4 gestos | q salir",
+            " Vista izquierda - Modo crudo: pulsa 1 rectificar | 2 triangular | 3 disparidad | 4 gestos |  5 YOLO_Deteccion | 6 YOLO_Entrenamiento | q salir",
         )
-        right_view = self._draw_header(frame_right, "Vista derecha en crudo")
+        right_view = self._draw_header(frame_right, "Vista derecha - Modo crudo: pulsa 1 rectificar | 2 triangular | 3 disparidad | 4 gestos |  5 YOLO_Deteccion | 6 YOLO_Entrenamiento | q salir")
 
         cv2.imshow(self.window_left, left_view)
         cv2.imshow(self.window_right, right_view)
@@ -202,6 +264,24 @@ class StereoInteractiveApp:
         cv2.imshow(self.window_right, right_view)
         cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
 
+    def _mode_yolo_boxes(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
+        # Modo 5: detección automática independiente en ambas lentes
+        try:
+            yolo = self._ensure_yolo()
+            _, left_view, _, right_view = yolo.predict_pair(frame_left, frame_right)
+
+            left_view = self._draw_header(left_view, "Modo 5: YOLOv8-seg en lente izquierda")
+            right_view = self._draw_header(right_view, "Modo 5: YOLOv8-seg en lente derecha")
+
+            cv2.imshow(self.window_left, left_view)
+            cv2.imshow(self.window_right, right_view)
+            cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
+        except (FileNotFoundError, RuntimeError) as exc:
+            warning = self._draw_header(frame_left, str(exc))
+            cv2.imshow(self.window_left, warning)
+            cv2.imshow(self.window_right, self._draw_header(frame_right, "Activa el modo 5 cuando exista tu best.pt"))
+            cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
+
     def run(self) -> None:
         # Abrir la cámara y comenzar el bucle principal
         if not self.camera.open():
@@ -211,7 +291,10 @@ class StereoInteractiveApp:
             )
 
         self._init_windows()
-        print("Aplicacion estereo iniciada. Teclas: 1 Rectificar | 2 Triangular | 3 Disparidad | 4 Gestos | q Salir")
+        print(
+            "Aplicacion estereo iniciada. Teclas: 1 Rectificar | 2 Triangular | 3 Disparidad | "
+            "4 Gestos | 5 YOLO | 6 Entrenar | 7 Captura | q Salir"
+        )
 
         try:
             while True:
@@ -232,6 +315,8 @@ class StereoInteractiveApp:
                     self._mode_disparity(frame_left, frame_right)
                 elif self.mode == self.MODE_GESTURES:
                     self._mode_gestures(frame_left, frame_right)
+                elif self.mode == self.MODE_YOLO_BOXES:
+                    self._mode_yolo_boxes(frame_left, frame_right)
 
                 # Procesar tecla
                 key = cv2.waitKey(1) & 0xFF
@@ -245,6 +330,13 @@ class StereoInteractiveApp:
                     self.mode = self.MODE_DISPARITY
                 elif key == ord("4"):
                     self.mode = self.MODE_GESTURES
+                elif key == ord("5"):
+                    self.mode = self.MODE_YOLO_BOXES
+                elif key == ord("6"):
+                    self._train_yolo()
+                    self.mode = self.MODE_YOLO_BOXES
+                elif key == ord("7"):
+                    self._capture_prelabeled(frame_left, frame_right)
                 elif key == ord("r") and self.mode == self.MODE_TRIANGULATION:
                     # Limpiar selección de puntos en modo triangulación
                     self.left_click = None
