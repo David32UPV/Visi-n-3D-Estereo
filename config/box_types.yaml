@@ -1,0 +1,9 @@
+# Configuracion de tipos de cajas para bin picking (v2)
+# Mantenido para compatibilidad con la evolucion a deteccion YOLO.
+
+box_types:
+  1:
+    name: "Wallbox"
+    width: 225
+    depth: 100
+    height: 162
