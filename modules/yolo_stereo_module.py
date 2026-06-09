@@ -591,6 +591,7 @@ class YoloSegBoxModule:
         left_detections = self._extract_detections(left_results[0])
         right_detections = self._extract_detections(right_results[0])
 
+        # Solo calculamos las coordenadas del mundo para la imagen izquierda, ya que para la derecha las sacamos con la disparidad
         for detection in left_detections:
             detection["world"] = self.stereo.get_3d_from_bbox_center(disparity, detection["bbox"])
 
@@ -598,6 +599,7 @@ class YoloSegBoxModule:
         right_annotated = right_results[0].plot()
 
         left_annotated = self._overlay_centroid_and_depth(left_annotated, left_detections)
+        right_annotated = self._overlay_centroid_and_depth(right_annotated, right_detections)
 
         return left_results[0], left_annotated, right_results[0], right_annotated, left_detections
 
