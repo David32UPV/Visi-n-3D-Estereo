@@ -54,7 +54,7 @@ class StereoInteractiveApp:
         calib_path = os.path.join(base_dir, "calibration", "stereo_calib.npz")
         dataset_yaml = os.path.join(
             base_dir,
-            "Etiquetado_Cajas_V3D.v2-dataset_2_clases_cajas.yolov8",
+            "etiquetado_5_tipos_de_cajas.yolov8",
             "data.yaml",
         )
 
@@ -70,7 +70,7 @@ class StereoInteractiveApp:
         self.yolo_dataset_yaml = dataset_yaml
         self.yolo_project_dir = Path(base_dir) / "runs" / "yolo_boxes"
         self.yolo_weights = self.yolo_project_dir / "boxes_seg" / "weights" / "best.pt"
-        self.prelabel_output_dir = Path(base_dir) / "images_pre_labeled"
+        self.prelabel_output_dir = Path(base_dir) / "images_pre_labeled_3"
         # Por defecto guardamos solo la vista izquierda; cambia esto a True si quieres ambos ojos.
         self.prelabel_save_both_views = False
 

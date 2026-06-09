@@ -56,7 +56,9 @@ class YoloSegBoxModule:
         custom_weights: str | Path | None = None,
         project_dir: str | Path = "runs/yolo_boxes",
         run_name: str = "boxes_seg",
-        split_fraction: float = 0.2,
+        train_fraction: float = 0.7,
+        val_fraction: float = 0.2,
+        test_fraction: float = 0.1,
         seed: int = 42,
     ) -> None:
         # Guardamos las rutas y parametros para no repetirlos en cada funcion.
@@ -66,8 +68,14 @@ class YoloSegBoxModule:
         self.custom_weights = Path(custom_weights) if custom_weights is not None else None
         self.project_dir = Path(project_dir)
         self.run_name = run_name
-        self.split_fraction = split_fraction
+        self.train_fraction = train_fraction
+        self.val_fraction = val_fraction
+        self.test_fraction = test_fraction
         self.seed = seed
+
+        split_total = self.train_fraction + self.val_fraction + self.test_fraction
+        if abs(split_total - 1.0) > 1e-6:
+            raise ValueError("`train_fraction + val_fraction + test_fraction` debe sumar 1.0.")
 
         # Cargamos la configuracion para validar clases y rutas desde el principio.
         self.class_names = self.load_dataset_config()["names"]
@@ -197,30 +205,34 @@ class YoloSegBoxModule:
         """Devuelve la ruta del YAML generado para el split local."""
         return self.dataset_root / ".yolo_split" / "data.yaml"
 
-    def _prepare_validation_split(self) -> Path:
-        """Asegura que exista un conjunto de validacion utilizable.
+    def _prepare_dataset_split(self) -> Path:
+        """Asegura que exista un conjunto train/valid/test utilizable.
 
-        Si el export de Roboflow ya trae `val`, no se toca nada y se reutiliza
-        el `data.yaml` original.
+        Si el export de Roboflow ya trae `val` y `test`, no se toca nada y se
+        reutiliza el `data.yaml` original.
 
-        Si no hay validacion, se crea una carpeta local `.yolo_split` con esta
+        Si no hay particiones locales, se crea una carpeta `.yolo_split` con esta
         estructura:
 
         - `.yolo_split/train/images`
         - `.yolo_split/train/labels`
+
         - `.yolo_split/valid/images`
         - `.yolo_split/valid/labels`
+        
+        - `.yolo_split/test/images`
+        - `.yolo_split/test/labels`
 
         Despues se genera un nuevo `data.yaml` minimo para que Ultralytics pueda
         entrenar sin que tengas que reorganizar el export manualmente.
         """
         config = self.load_dataset_config()
 
-        # Si ya existe validacion real, usamos el YAML original tal cual.
-        if config["val"] is not None and config["val"].exists():
+        # Si ya existe validacion y test reales, usamos el YAML original tal cual.
+        if config["val"] is not None and config["val"].exists() and config["test"] is not None and config["test"].exists():
             return self.dataset_yaml
 
-        # Si no hay `val`, tomamos las imagenes del entrenamiento y las repartimos.
+        # Si no hay particiones completas, tomamos las imagenes del entrenamiento y las repartimos.
         source_images = config["train"]
         source_labels = source_images.parent / "labels"
         images = sorted(
@@ -239,10 +251,8 @@ class YoloSegBoxModule:
         train_labels_dir = split_root / "train" / "labels"
         valid_images_dir = split_root / "valid" / "images"
         valid_labels_dir = split_root / "valid" / "labels"
-
-        # Evitamos recalcular si el split ya se habia generado antes.
-        if self._generated_dataset_yaml().exists() and train_images_dir.exists() and valid_images_dir.exists():
-            return self._generated_dataset_yaml()
+        test_images_dir = split_root / "test" / "images"
+        test_labels_dir = split_root / "test" / "labels"
 
         # Rehacemos el split desde cero para garantizar consistencia.
         if split_root.exists():
@@ -253,17 +263,50 @@ class YoloSegBoxModule:
         train_labels_dir.mkdir(parents=True, exist_ok=True)
         valid_images_dir.mkdir(parents=True, exist_ok=True)
         valid_labels_dir.mkdir(parents=True, exist_ok=True)
+        test_images_dir.mkdir(parents=True, exist_ok=True)
+        test_labels_dir.mkdir(parents=True, exist_ok=True)
 
         # Barajamos de forma reproducible para que el split sea estable.
         shuffled = images[:]
         random.Random(self.seed).shuffle(shuffled)
-        valid_count = max(1, int(round(len(shuffled) * self.split_fraction))) if len(shuffled) > 1 else 1
-        valid_set = set(shuffled[:valid_count])
+        total = len(shuffled)
+        if total < 3:
+            raise ValueError("Se necesitan al menos 3 imagenes para crear split train/valid/test.")
 
-        # Copiamos imagen y etiqueta a train o valid según corresponda.
+        train_count = max(1, int(round(total * self.train_fraction)))
+        valid_count = max(1, int(round(total * self.val_fraction)))
+        test_count = total - train_count - valid_count
+
+        if test_count < 1:
+            test_count = 1
+            if train_count > valid_count and train_count > 1:
+                train_count -= 1
+            elif valid_count > 1:
+                valid_count -= 1
+            else:
+                train_count -= 1
+
+        if train_count < 1:
+            train_count = 1
+        if train_count + valid_count + test_count != total:
+            train_count = total - valid_count - test_count
+
+        train_set = set(shuffled[:train_count])
+        valid_set = set(shuffled[train_count:train_count + valid_count])
+        test_set = set(shuffled[train_count + valid_count:])
+
+        # Copiamos imagen y etiqueta a train, valid o test según corresponda.
         for image_path in shuffled:
-            target_image_dir = valid_images_dir if image_path in valid_set else train_images_dir
-            target_label_dir = valid_labels_dir if image_path in valid_set else train_labels_dir
+            if image_path in train_set:
+                target_image_dir = train_images_dir
+                target_label_dir = train_labels_dir
+            elif image_path in valid_set:
+                target_image_dir = valid_images_dir
+                target_label_dir = valid_labels_dir
+            else:
+                target_image_dir = test_images_dir
+                target_label_dir = test_labels_dir
+
             shutil.copy2(image_path, target_image_dir / image_path.name)
 
             label_path = source_labels / f"{image_path.stem}.txt"
@@ -279,6 +322,7 @@ class YoloSegBoxModule:
         generated_config = {
             "train": "train/images",
             "val": "valid/images",
+            "test": "test/images",
             "nc": config["nc"],
             "names": config["names"],
         }
@@ -312,11 +356,11 @@ class YoloSegBoxModule:
 
     def train_model(
         self,
-        epochs: int = 50,
-        imgsz: int = 512,
-        batch: Optional[int] = None,
+        epochs: int = 100,
+        imgsz: int = 640,
+        batch: Optional[int] = 4,
         device: Optional[str | int] = None,
-        patience: int = 30,
+        patience: int = 20,
         pretrained_weights: str | Path | None = None,
         exist_ok: bool = True,
     ) -> Any:
@@ -335,7 +379,7 @@ class YoloSegBoxModule:
         """
 
         YOLO = self._yolo_class()
-        data_yaml = self._prepare_validation_split()
+        data_yaml = self._prepare_dataset_split()
         model = YOLO(str(pretrained_weights or self.weights))
 
         # Solo añadimos los argumentos que realmente queremos controlar.

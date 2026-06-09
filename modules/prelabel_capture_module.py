@@ -22,7 +22,7 @@ import numpy as np
 class PrelabelCaptureModule:
     """Guarda capturas de la ZED para etiquetado posterior."""
 
-    def __init__(self, output_root: str | Path = "images_pre_labeled", save_both_views: bool = False) -> None:
+    def __init__(self, output_root: str | Path = "images_pre_labeled_3", save_both_views: bool = False) -> None:
         self.output_root = Path(output_root)
         self.save_both_views = save_both_views
 

@@ -1,0 +1,10 @@
+train: train/images
+val: valid/images
+test: test/images
+nc: 5
+names:
+- caja_busbar
+- caja_chasis
+- caja_manguera
+- caja_pcb
+- caja_potencia

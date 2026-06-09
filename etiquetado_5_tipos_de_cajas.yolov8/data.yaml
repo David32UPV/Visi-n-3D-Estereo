@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 5
+names: ['caja_busbar', 'caja_chasis', 'caja_manguera', 'caja_pcb', 'caja_potencia']
+
+roboflow:
+  workspace: davids-workspace-z5vrq
+  project: etiquetado_5_tipos_de_cajas
+  version: dataset
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/davids-workspace-z5vrq/etiquetado_5_tipos_de_cajas/dataset/dataset
