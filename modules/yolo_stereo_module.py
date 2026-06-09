@@ -219,7 +219,7 @@ class YoloSegBoxModule:
 
         - `.yolo_split/valid/images`
         - `.yolo_split/valid/labels`
-        
+
         - `.yolo_split/test/images`
         - `.yolo_split/test/labels`
 

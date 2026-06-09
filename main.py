@@ -14,11 +14,14 @@ Controles:
 - Tecla 7: guardar captura de la lente izquierda en images_pre_labeled/
 - q: salir
 - r: limpiar puntos seleccionados (modo 2)
+
+
+IMPORTANTE: cambiar lo de que al ejecutar main me salgan 2 ventanas, una por lente, 
+a que me salga una sola ventana con ambas vistas lado a lado
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -49,33 +52,64 @@ class StereoInteractiveApp:
     MODE_GESTURES = 4
     MODE_YOLO_BOXES = 5
 
-    def __init__(self) -> None:
-        base_dir = os.path.dirname(__file__)
-        calib_path = os.path.join(base_dir, "calibration", "stereo_calib.npz")
-        dataset_yaml = os.path.join(
-            base_dir,
-            "etiquetado_5_tipos_de_cajas.yolov8",
-            "data.yaml",
-        )
+    @staticmethod
+    def _find_recursive_path(root: Path, filename: str, preferred_parent: str | None = None) -> Optional[Path]:
+        matches = [path for path in root.rglob(filename) if path.is_file()]
+        if preferred_parent is not None:
+            for path in matches:
+                if preferred_parent in {parent.name for parent in path.parents}:
+                    return path
+        return matches[0] if matches else None
 
-        if not os.path.exists(calib_path):
+    @classmethod
+    def _resolve_dataset_yaml(cls, base_dir: Path) -> Path:
+        preferred = base_dir / "etiquetado_5_tipos_de_cajas.yolov8" / "data.yaml"
+        if preferred.exists():
+            return preferred
+
+        fallback = cls._find_recursive_path(base_dir, "data.yaml", preferred_parent="etiquetado_5_tipos_de_cajas.yolov8")
+        if fallback is not None:
+            return fallback
+
+        return preferred
+
+    @classmethod
+    def _resolve_yolo_weights(cls, base_dir: Path) -> Path:
+        preferred = base_dir / "runs" / "yolo_boxes" / "boxes_seg" / "weights" / "best.pt"
+        if preferred.exists():
+            return preferred
+
+        fallback = cls._find_recursive_path(base_dir, "best.pt", preferred_parent="boxes_seg")
+        if fallback is not None:
+            return fallback
+
+        return preferred
+
+    def __init__(self) -> None:
+        base_dir = Path(__file__).resolve().parent
+        calib_path = base_dir / "calibration" / "stereo_calib.npz"
+        dataset_yaml = self._resolve_dataset_yaml(base_dir)
+
+        if not calib_path.exists():
             raise FileNotFoundError(f"Fichero de calibración no encontrado: {calib_path}")
+        if not dataset_yaml.exists():
+            raise FileNotFoundError(f"No existe el dataset YAML: {dataset_yaml}")
 
         # Inicializaciones principales
         self.camera = ZEDCamera()
-        self.stereo = StereoTriangulator(calib_path=calib_path, image_size=(1280, 720))
+        self.stereo = StereoTriangulator(calib_path=str(calib_path), image_size=(1280, 720))
         self.gesture: Optional[GestureRecognizer] = None
         self.yolo: Optional[YoloSegBoxModule] = None
         self.prelabel_capture: Optional[PrelabelCaptureModule] = None
         self.yolo_dataset_yaml = dataset_yaml
-        self.yolo_project_dir = Path(base_dir) / "runs" / "yolo_boxes"
-        self.yolo_weights = self.yolo_project_dir / "boxes_seg" / "weights" / "best.pt"
-        self.prelabel_output_dir = Path(base_dir) / "images_pre_labeled_3"
+        self.yolo_weights = self._resolve_yolo_weights(base_dir)
+        self.yolo_project_dir = self.yolo_weights.parent.parent.parent if self.yolo_weights.exists() else base_dir / "runs" / "yolo_boxes"
+        self.prelabel_output_dir = base_dir / "images_pre_labeled_3"
         # Por defecto guardamos solo la vista izquierda; cambia esto a True si quieres ambos ojos.
         self.prelabel_save_both_views = False
 
         # Estado del modo y ventanas
-        self.mode = self.MODE_RAW
+        self.mode = self.MODE_YOLO_BOXES
         self.window_left = "ZED2 Left"
         self.window_right = "ZED2 Right"
         self.window_aux = "ZED2 Disparity"
@@ -103,7 +137,8 @@ class StereoInteractiveApp:
         )
         print("Iniciando entrenamiento YOLOv8-seg con el dataset de Roboflow...")
         self.yolo.train_model()
-        self.yolo_weights = self.yolo_project_dir / "boxes_seg" / "weights" / "best.pt"
+        self.yolo_weights = self._resolve_yolo_weights(Path(__file__).resolve().parent)
+        self.yolo_project_dir = self.yolo_weights.parent.parent.parent if self.yolo_weights.exists() else self.yolo_project_dir
         print(f"Entrenamiento terminado. Checkpoint listo en: {self.yolo_weights}")
 
     def _ensure_prelabel_capture(self) -> PrelabelCaptureModule:
@@ -291,9 +326,10 @@ class StereoInteractiveApp:
             )
 
         self._init_windows()
+        self._ensure_yolo()
         print(
-            "Aplicacion estereo iniciada. Teclas: 1 Rectificar | 2 Triangular | 3 Disparidad | "
-            "4 Gestos | 5 YOLO | 6 Entrenar | 7 Captura | q Salir"
+            "Aplicacion estereo iniciada. Arranque automatico en modo YOLO. Teclas: 1 Rectificar | "
+            "2 Triangular | 3 Disparidad | 4 Gestos | 5 YOLO | 6 Entrenar | 7 Captura | q Salir"
         )
 
         try:
