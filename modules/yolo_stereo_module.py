@@ -54,6 +54,7 @@ class YoloSegBoxModule:
         dataset_yaml: str | Path,
         weights: str = "yolov8n-seg.pt",
         custom_weights: str | Path | None = None,
+        stereo: Any | None = None,
         project_dir: str | Path = "runs/yolo_boxes",
         run_name: str = "boxes_seg",
         train_fraction: float = 0.7,
@@ -66,6 +67,7 @@ class YoloSegBoxModule:
         self.dataset_root = self.dataset_yaml.parent
         self.weights = weights
         self.custom_weights = Path(custom_weights) if custom_weights is not None else None
+        self.stereo = stereo
         self.project_dir = Path(project_dir)
         self.run_name = run_name
         self.train_fraction = train_fraction
@@ -82,6 +84,122 @@ class YoloSegBoxModule:
 
         # Se rellena cuando se carga o entrena un modelo.
         self.model: Any = None
+
+    @staticmethod
+    def _bbox_center(bbox: np.ndarray | list[float] | tuple[float, ...]) -> tuple[float, float]:
+        x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+    @staticmethod
+    def _result_name_map(result: Any) -> dict[int, str]:
+        names = getattr(result, "names", None)
+        if isinstance(names, dict):
+            return {int(key): str(value) for key, value in names.items()}
+        if isinstance(names, list):
+            return {index: str(name) for index, name in enumerate(names)}
+        return {}
+
+    def _extract_detections(self, result: Any) -> list[dict[str, Any]]:
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or len(boxes) == 0:
+            return []
+
+        xyxy = boxes.xyxy.cpu().numpy()
+        confidences = boxes.conf.cpu().numpy() if getattr(boxes, "conf", None) is not None else np.ones(len(xyxy), dtype=np.float32)
+        class_ids = boxes.cls.cpu().numpy() if getattr(boxes, "cls", None) is not None else np.zeros(len(xyxy), dtype=np.float32)
+        names = self._result_name_map(result)
+
+        detections: list[dict[str, Any]] = []
+        for index, bbox in enumerate(xyxy):
+            center_u, center_v = self._bbox_center(bbox)
+            class_id = int(class_ids[index]) if index < len(class_ids) else -1
+            detections.append(
+                {
+                    "bbox": tuple(float(value) for value in bbox[:4]),
+                    "center": (float(center_u), float(center_v)),
+                    "class_id": class_id,
+                    "class_name": names.get(class_id, str(class_id)),
+                    "confidence": float(confidences[index]) if index < len(confidences) else 0.0,
+                }
+            )
+
+        return detections
+
+    def _draw_detections(
+        self,
+        frame: np.ndarray,
+        detections: list[dict[str, Any]],
+        disparity: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, list[dict[str, Any]]]:
+        out = frame.copy()
+        enriched: list[dict[str, Any]] = []
+
+        for detection in detections:
+            x1, y1, x2, y2 = detection["bbox"]
+            cx, cy = detection["center"]
+            center_int = (int(round(cx)), int(round(cy)))
+
+            cv2.rectangle(out, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), (0, 255, 0), 2)
+            cv2.circle(out, center_int, 5, (0, 0, 255), -1)
+
+            label = f"{detection['class_name']} {detection['confidence']:.2f}"
+            cv2.putText(out, label, (int(round(x1)), max(20, int(round(y1)) - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(out, f"C=({center_int[0]}, {center_int[1]})", (int(round(x1)), min(out.shape[0] - 10, int(round(y2)) + 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+            enriched_detection = dict(detection)
+            if disparity is not None and self.stereo is not None:
+                world_point = self.stereo.get_3d_from_bbox_center(disparity, detection["bbox"])
+                enriched_detection["world"] = world_point
+                if world_point is not None:
+                    x_world, y_world, z_world = world_point
+                    depth_text = f"X={x_world:.1f} Y={y_world:.1f} Z={z_world:.1f}"
+                else:
+                    depth_text = "X/Y/Z=inv"
+                cv2.putText(out, depth_text, (int(round(x1)), min(out.shape[0] - 10, int(round(y2)) + 38)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+            enriched.append(enriched_detection)
+
+        return out, enriched
+
+    @staticmethod
+    def _overlay_centroid_and_depth(
+        frame: np.ndarray,
+        detections: list[dict[str, Any]],
+    ) -> np.ndarray:
+        out = frame.copy()
+        for detection in detections:
+            x1, y1, x2, y2 = detection["bbox"]
+            cx, cy = detection["center"]
+            center_int = (int(round(cx)), int(round(cy)))
+
+            cv2.circle(out, center_int, 5, (0, 0, 255), -1)
+            cv2.putText(
+                out,
+                f"C=({center_int[0]}, {center_int[1]})",
+                (int(round(x1)), min(out.shape[0] - 10, int(round(y2)) + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                2,
+            )
+
+            world_point = detection.get("world")
+            if world_point is not None:
+                x_world, y_world, z_world = world_point
+                depth_text = f"X={x_world:.1f} Y={y_world:.1f} Z={z_world:.1f}"
+            else:
+                depth_text = "X/Y/Z=inv"
+
+            cv2.putText(
+                out,
+                depth_text,
+                (int(round(x1)), min(out.shape[0] - 10, int(round(y2)) + 38)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 0),
+                2,
+            )
+
+        return out
 
     @staticmethod
     def _yaml() -> Any:
@@ -442,6 +560,46 @@ class YoloSegBoxModule:
         results = active_model.predict(source=frame, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
         annotated = results[0].plot()
         return results[0], annotated
+
+    def predict_pair_with_depth(
+        self,
+        frame_left: np.ndarray,
+        frame_right: np.ndarray,
+        model: Any | None = None,
+        conf: float = 0.25,
+        iou: float = 0.7,
+        imgsz: int = 512,
+    ) -> Tuple[Any, np.ndarray, Any, np.ndarray, list[dict[str, Any]]]:
+        """Ejecuta YOLO sobre el par rectificado y añade profundidad en el frame izquierdo.
+
+        El centroide se toma del bbox. La profundidad y las coordenadas 3D se
+        obtienen a partir de la disparidad calculada con `StereoTriangulator`.
+        """
+        if self.stereo is None:
+            raise RuntimeError("Falta la instancia de StereoTriangulator para calcular profundidad.")
+
+        active_model = model or self.model
+        if active_model is None:
+            active_model = self.load_trained_model()
+
+        rect_left, rect_right = self.stereo.rectify(frame_left, frame_right)
+        disparity = self.stereo.compute_disparity(rect_left, rect_right)
+
+        left_results = active_model.predict(source=rect_left, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
+        right_results = active_model.predict(source=rect_right, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
+
+        left_detections = self._extract_detections(left_results[0])
+        right_detections = self._extract_detections(right_results[0])
+
+        for detection in left_detections:
+            detection["world"] = self.stereo.get_3d_from_bbox_center(disparity, detection["bbox"])
+
+        left_annotated = left_results[0].plot()
+        right_annotated = right_results[0].plot()
+
+        left_annotated = self._overlay_centroid_and_depth(left_annotated, left_detections)
+
+        return left_results[0], left_annotated, right_results[0], right_annotated, left_detections
 
     def predict_pair(
         self,

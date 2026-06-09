@@ -264,6 +264,24 @@ class StereoTriangulator:
         # Devolver como tupla de flotantes
         return float(point[0]), float(point[1]), float(point[2])
 
+    def get_3d_from_bbox_center(
+        self,
+        disparity: np.ndarray,
+        bbox: Sequence[float],
+    ) -> Optional[Tuple[float, float, float]]:
+        """Obtiene la coordenada 3D del centro de un bbox usando la disparidad.
+
+        El bbox debe venir en formato (x1, y1, x2, y2) sobre la imagen rectificada.
+        El punto de muestreo se toma como el centro geométrico de la caja.
+        """
+        if len(bbox) < 4:
+            raise ValueError("El bbox debe contener al menos 4 valores: x1, y1, x2, y2")
+
+        x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+        center_u = int(round((x1 + x2) / 2.0))
+        center_v = int(round((y1 + y2) / 2.0))
+        return self.get_3d_from_pixel(disparity, center_u, center_v)
+
     @staticmethod
     def draw_epilines(rect_left: np.ndarray, rect_right: np.ndarray, step: int = 40) -> Tuple[np.ndarray, np.ndarray]:
         """Dibuja líneas epipolares horizontales para comprobar la rectificación.
