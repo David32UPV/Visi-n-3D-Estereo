@@ -164,11 +164,15 @@ class YoloSegBoxModule:
     def _overlay_centroid_and_depth(
         frame: np.ndarray,
         detections: list[dict[str, Any]],
+        center_key: str = "center",
     ) -> np.ndarray:
         out = frame.copy()
         for detection in detections:
             x1, y1, x2, y2 = detection["bbox"]
-            cx, cy = detection["center"]
+            center = detection.get(center_key)
+            if center is None:
+                center = detection["center"]
+            cx, cy = center
             center_int = (int(round(cx)), int(round(cy)))
 
             cv2.circle(out, center_int, 5, (0, 0, 255), -1)
@@ -589,17 +593,18 @@ class YoloSegBoxModule:
         right_results = active_model.predict(source=rect_right, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
 
         left_detections = self._extract_detections(left_results[0])
-        right_detections = self._extract_detections(right_results[0])
 
-        # Solo calculamos las coordenadas del mundo para la imagen izquierda, ya que para la derecha las sacamos con la disparidad
+        # Solo calculamos las coordenadas del mundo para la imagen izquierda y proyectamos ese mismo punto al lado derecho.
         for detection in left_detections:
+            detection["disparity"] = self.stereo.get_disparity_at_bbox_center(disparity, detection["bbox"])
+            detection["right_center"] = self.stereo.get_right_center_from_bbox_center(disparity, detection["bbox"])
             detection["world"] = self.stereo.get_3d_from_bbox_center(disparity, detection["bbox"])
 
         left_annotated = left_results[0].plot()
         right_annotated = right_results[0].plot()
 
         left_annotated = self._overlay_centroid_and_depth(left_annotated, left_detections)
-        right_annotated = self._overlay_centroid_and_depth(right_annotated, right_detections)
+        right_annotated = self._overlay_centroid_and_depth(right_annotated, left_detections, center_key="right_center")
 
         return left_results[0], left_annotated, right_results[0], right_annotated, left_detections
 

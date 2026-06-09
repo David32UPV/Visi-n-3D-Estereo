@@ -282,6 +282,48 @@ class StereoTriangulator:
         center_v = int(round((y1 + y2) / 2.0))
         return self.get_3d_from_pixel(disparity, center_u, center_v)
 
+    def get_disparity_at_bbox_center(
+        self,
+        disparity: np.ndarray,
+        bbox: Sequence[float],
+    ) -> Optional[float]:
+        """Devuelve la disparidad exacta del centro geométrico de un bbox."""
+        if len(bbox) < 4:
+            raise ValueError("El bbox debe contener al menos 4 valores: x1, y1, x2, y2")
+
+        x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+        center_u = int(round((x1 + x2) / 2.0))
+        center_v = int(round((y1 + y2) / 2.0))
+        h, w = disparity.shape[:2]
+        if center_u < 0 or center_v < 0 or center_u >= w or center_v >= h:
+            return None
+
+        value = float(disparity[center_v, center_u])
+        if not np.isfinite(value) or value <= 0.0:
+            return None
+
+        return value
+
+    def get_right_center_from_bbox_center(
+        self,
+        disparity: np.ndarray,
+        bbox: Sequence[float],
+    ) -> Optional[Tuple[int, int]]:
+        """Projeta el centro de un bbox de la izquierda a la vista derecha rectificada."""
+        if len(bbox) < 4:
+            raise ValueError("El bbox debe contener al menos 4 valores: x1, y1, x2, y2")
+
+        x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+        center_u = int(round((x1 + x2) / 2.0))
+        center_v = int(round((y1 + y2) / 2.0))
+
+        d = self.get_disparity_at_bbox_center(disparity, bbox)
+        if d is None:
+            return None
+
+        right_u = int(round(center_u - d))
+        return right_u, center_v
+
     @staticmethod
     def draw_epilines(rect_left: np.ndarray, rect_right: np.ndarray, step: int = 40) -> Tuple[np.ndarray, np.ndarray]:
         """Dibuja líneas epipolares horizontales para comprobar la rectificación.
