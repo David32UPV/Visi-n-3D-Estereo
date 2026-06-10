@@ -91,6 +91,25 @@ class YoloSegBoxModule:
         return (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
     @staticmethod
+    def _mask_centroid_from_polygon(mask_polygon: Any) -> Optional[tuple[float, float]]:
+        """Calcula el centroide de una máscara poligonal usando cv2.moments."""
+        if mask_polygon is None:
+            return None
+
+        polygon = np.asarray(mask_polygon, dtype=np.float32)
+        if polygon.ndim != 2 or polygon.shape[0] < 3 or polygon.shape[1] != 2:
+            return None
+
+        contour = np.round(polygon).astype(np.int32).reshape(-1, 1, 2)
+        moments = cv2.moments(contour)
+        if abs(moments["m00"]) <= 1e-6:
+            return None
+
+        cx = float(moments["m10"] / moments["m00"])
+        cy = float(moments["m01"] / moments["m00"])
+        return cx, cy
+
+    @staticmethod
     def _result_name_map(result: Any) -> dict[int, str]:
         names = getattr(result, "names", None)
         if isinstance(names, dict):
@@ -104,6 +123,9 @@ class YoloSegBoxModule:
         if boxes is None or len(boxes) == 0:
             return []
 
+        masks = getattr(result, "masks", None)
+        masks_xy = getattr(masks, "xy", None) if masks is not None else None
+
         xyxy = boxes.xyxy.cpu().numpy()
         confidences = boxes.conf.cpu().numpy() if getattr(boxes, "conf", None) is not None else np.ones(len(xyxy), dtype=np.float32)
         class_ids = boxes.cls.cpu().numpy() if getattr(boxes, "cls", None) is not None else np.zeros(len(xyxy), dtype=np.float32)
@@ -111,7 +133,16 @@ class YoloSegBoxModule:
 
         detections: list[dict[str, Any]] = []
         for index, bbox in enumerate(xyxy):
-            center_u, center_v = self._bbox_center(bbox)
+            center_from_mask = None
+            if masks_xy is not None and index < len(masks_xy):
+                center_from_mask = self._mask_centroid_from_polygon(masks_xy[index])
+
+            if center_from_mask is None:
+                center_u, center_v = self._bbox_center(bbox)
+                print(f"[YOLO] Fallback a centroide de bbox en deteccion {index}: mascara no disponible o invalida")
+            else:
+                center_u, center_v = center_from_mask
+
             class_id = int(class_ids[index]) if index < len(class_ids) else -1
             detections.append(
                 {
@@ -136,7 +167,11 @@ class YoloSegBoxModule:
 
         for detection in detections:
             x1, y1, x2, y2 = detection["bbox"]
-            cx, cy = detection["center"]
+            center = detection.get("center")
+            if center is None or len(center) != 2:
+                center = self._bbox_center(detection["bbox"])
+                print("[YOLO] Fallback a centroide de bbox en _draw_detections: center ausente o invalido")
+            cx, cy = center
             center_int = (int(round(cx)), int(round(cy)))
 
             cv2.rectangle(out, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), (0, 255, 0), 2)
@@ -371,8 +406,10 @@ class YoloSegBoxModule:
         split_root = self.dataset_root / ".yolo_split"
         train_images_dir = split_root / "train" / "images"
         train_labels_dir = split_root / "train" / "labels"
+
         valid_images_dir = split_root / "valid" / "images"
         valid_labels_dir = split_root / "valid" / "labels"
+        
         test_images_dir = split_root / "test" / "images"
         test_labels_dir = split_root / "test" / "labels"
 
@@ -383,8 +420,10 @@ class YoloSegBoxModule:
         # Creamos la estructura esperada por Ultralytics.
         train_images_dir.mkdir(parents=True, exist_ok=True)
         train_labels_dir.mkdir(parents=True, exist_ok=True)
+
         valid_images_dir.mkdir(parents=True, exist_ok=True)
         valid_labels_dir.mkdir(parents=True, exist_ok=True)
+
         test_images_dir.mkdir(parents=True, exist_ok=True)
         test_labels_dir.mkdir(parents=True, exist_ok=True)
 
@@ -596,9 +635,10 @@ class YoloSegBoxModule:
 
         # Solo calculamos las coordenadas del mundo para la imagen izquierda y proyectamos ese mismo punto al lado derecho.
         for detection in left_detections:
-            detection["disparity"] = self.stereo.get_disparity_at_bbox_center(disparity, detection["bbox"])
-            detection["right_center"] = self.stereo.get_right_center_from_bbox_center(disparity, detection["bbox"])
-            detection["world"] = self.stereo.get_3d_from_bbox_center(disparity, detection["bbox"])
+            centroid = detection["center"]
+            detection["disparity"] = self.stereo.get_disparity_at_centroid(disparity, centroid)
+            detection["right_center"] = self.stereo.get_right_center_from_centroid(disparity, centroid)
+            detection["world"] = self.stereo.get_3d_from_centroid(disparity, centroid)
 
         left_annotated = left_results[0].plot()
         right_annotated = right_results[0].plot()

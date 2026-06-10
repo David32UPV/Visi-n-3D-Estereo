@@ -278,8 +278,20 @@ class StereoTriangulator:
             raise ValueError("El bbox debe contener al menos 4 valores: x1, y1, x2, y2")
 
         x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
-        center_u = int(round((x1 + x2) / 2.0))
-        center_v = int(round((y1 + y2) / 2.0))
+        center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        return self.get_3d_from_centroid(disparity, center)
+
+    def get_3d_from_centroid(
+        self,
+        disparity: np.ndarray,
+        centroid: Sequence[float],
+    ) -> Optional[Tuple[float, float, float]]:
+        """Obtiene la coordenada 3D de un centroide (u,v) en la imagen rectificada izquierda."""
+        if len(centroid) < 2:
+            raise ValueError("El centroide debe contener al menos 2 valores: u, v")
+
+        center_u = int(round(float(centroid[0])))
+        center_v = int(round(float(centroid[1])))
         return self.get_3d_from_pixel(disparity, center_u, center_v)
 
     def get_disparity_at_bbox_center(
@@ -292,8 +304,20 @@ class StereoTriangulator:
             raise ValueError("El bbox debe contener al menos 4 valores: x1, y1, x2, y2")
 
         x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
-        center_u = int(round((x1 + x2) / 2.0))
-        center_v = int(round((y1 + y2) / 2.0))
+        center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        return self.get_disparity_at_centroid(disparity, center)
+
+    def get_disparity_at_centroid(
+        self,
+        disparity: np.ndarray,
+        centroid: Sequence[float],
+    ) -> Optional[float]:
+        """Devuelve la disparidad exacta de un centroide (u,v) en la imagen rectificada izquierda."""
+        if len(centroid) < 2:
+            raise ValueError("El centroide debe contener al menos 2 valores: u, v")
+
+        center_u = int(round(float(centroid[0])))
+        center_v = int(round(float(centroid[1])))
         h, w = disparity.shape[:2]
         if center_u < 0 or center_v < 0 or center_u >= w or center_v >= h:
             return None
@@ -314,10 +338,22 @@ class StereoTriangulator:
             raise ValueError("El bbox debe contener al menos 4 valores: x1, y1, x2, y2")
 
         x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
-        center_u = int(round((x1 + x2) / 2.0))
-        center_v = int(round((y1 + y2) / 2.0))
+        center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        return self.get_right_center_from_centroid(disparity, center)
 
-        d = self.get_disparity_at_bbox_center(disparity, bbox)
+    def get_right_center_from_centroid(
+        self,
+        disparity: np.ndarray,
+        centroid: Sequence[float],
+    ) -> Optional[Tuple[int, int]]:
+        """Projeta un centroide de la izquierda a la vista derecha rectificada usando disparidad."""
+        if len(centroid) < 2:
+            raise ValueError("El centroide debe contener al menos 2 valores: u, v")
+
+        center_u = int(round(float(centroid[0])))
+        center_v = int(round(float(centroid[1])))
+
+        d = self.get_disparity_at_centroid(disparity, centroid)
         if d is None:
             return None
 
