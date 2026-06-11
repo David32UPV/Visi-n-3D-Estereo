@@ -544,6 +544,7 @@ class YoloSegBoxModule:
         model = YOLO(str(pretrained_weights or self.weights))
 
         # Solo añadimos los argumentos que realmente queremos controlar.
+		# patience = nº de epochs consecutivos que el algoritmo debe esperar sin que haya mejoras en mAp antes de detener el entrenamiento automáticamente.
         train_kwargs: dict[str, Any] = {
             "data": str(data_yaml),
             "epochs": epochs,

@@ -1,8 +1,8 @@
 """Reconocimiento de gestos con MediaPipe para frames estéreo.
 
-Este módulo encapsula la carga del modelo de gestos de MediaPipe y la
-interfaz mínima para procesar imágenes BGR y obtener las etiquetas de gestos
-detectadas junto con la imagen anotada.
+Usa la Tasks API de mediapipe 0.10.x (única disponible en esa versión).
+Los landmarks se dibujan manualmente con OpenCV, sin depender de
+mp.solutions ni de landmark_pb2.
 """
 
 from __future__ import annotations
@@ -14,105 +14,102 @@ from typing import List, Tuple
 import cv2
 import numpy as np
 
+_HAND_CONNECTIONS = frozenset([
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (5, 6), (6, 7), (7, 8),
+    (9, 10), (10, 11), (11, 12),
+    (13, 14), (14, 15), (15, 16),
+    (17, 18), (18, 19), (19, 20),
+    (0, 5), (5, 9), (9, 13), (13, 17), (0, 17),
+])
+
+_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
+)
+
 
 class GestureRecognizer:
-    """Reconoce gestos de la mano usando MediaPipe Gesture Recognizer."""
+    """Reconoce gestos de la mano usando la Tasks API de mediapipe 0.10.x."""
 
-    def __init__(self, model_path: str = "gesture_recognizer.task"):
-        """
-        Inicializa el reconocedor de gestos.
-        Descarga el modelo si no existe.
-        """
+    def __init__(self, model_path: str = "gesture_recognizer.task") -> None:
         try:
             import mediapipe as mp
-            from mediapipe.framework.formats import landmark_pb2
         except ImportError as exc:
             raise ImportError(
                 "MediaPipe es necesario para el modo de gestos. Instálalo con: pip install mediapipe"
             ) from exc
 
-        self.mp = mp
-        self.landmark_pb2 = landmark_pb2
         self.model_path = model_path
         self._download_model_if_needed()
 
-        print("Inicializando MediaPipe Gesture Recognizer...")
-        BaseOptions = self.mp.tasks.BaseOptions
-        GestureRecognizerTask = self.mp.tasks.vision.GestureRecognizer
-        GestureRecognizerOptions = self.mp.tasks.vision.GestureRecognizerOptions
-        VisionRunningMode = self.mp.tasks.vision.RunningMode
+        BaseOptions = mp.tasks.BaseOptions
+        GestureRecognizerTask = mp.tasks.vision.GestureRecognizer
+        GestureRecognizerOptions = mp.tasks.vision.GestureRecognizerOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
 
         options = GestureRecognizerOptions(
             base_options=BaseOptions(model_asset_path=self.model_path),
             running_mode=VisionRunningMode.IMAGE,
-            num_hands=2
+            num_hands=2,
         )
-        self.recognizer = GestureRecognizerTask.create_from_options(options)
+        self._recognizer = GestureRecognizerTask.create_from_options(options)
+        self._mp = mp
 
-        self.mp_drawing = self.mp.solutions.drawing_utils
-        self.mp_hands = self.mp.solutions.hands
-
-    def _download_model_if_needed(self):
-        """Descarga el modelo oficial de MediaPipe si no existe localmente."""
+    def _download_model_if_needed(self) -> None:
         if not os.path.exists(self.model_path):
-            print("Descargando el modelo de gestos de MediaPipe (solo primera ejecución)...")
-            url = "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
-            urllib.request.urlretrieve(url, self.model_path)
+            print("Descargando modelo de gestos de MediaPipe (solo primera ejecución)...")
+            urllib.request.urlretrieve(_MODEL_URL, self.model_path)
             print("Modelo descargado.")
 
+    @staticmethod
+    def _draw_hand(frame: np.ndarray, landmarks) -> None:
+        """Dibuja esqueleto y bounding box de una mano directamente con OpenCV."""
+        h, w, _ = frame.shape
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+
+        for start, end in _HAND_CONNECTIONS:
+            cv2.line(frame, pts[start], pts[end], (255, 0, 0), 2)
+        for pt in pts:
+            cv2.circle(frame, pt, 4, (0, 255, 0), -1)
+
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        cv2.rectangle(
+            frame,
+            (max(0, min(xs) - 20), max(0, min(ys) - 20)),
+            (min(w, max(xs) + 20), min(h, max(ys) + 20)),
+            (0, 255, 255), 2,
+        )
+
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[str]]:
-        """
-        Procesa un frame, detecta manos, dibuja el esqueleto y la hitbox,
-        y devuelve la imagen anotada junto con la lista de gestos detectados.
-
-        Args:
-            frame: Imagen BGR de la cámara.
-
-        Returns:
-            Tupla (frame_anotado, lista_de_gestos).
-        """
+        """Procesa un frame BGR y devuelve la imagen anotada y los gestos detectados."""
         result_frame = frame.copy()
-        detected_gestures = []
+        detected_gestures: List[str] = []
 
-        # MediaPipe espera imágenes RGB
-        rgb_frame = cv2.cvtColor(result_frame, cv2.COLOR_BGR2RGB)
-        mp_image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb_frame)
+        rgb = cv2.cvtColor(result_frame, cv2.COLOR_BGR2RGB)
+        mp_image = self._mp.Image(
+            image_format=self._mp.ImageFormat.SRGB, data=rgb
+        )
+        result = self._recognizer.recognize(mp_image)
 
-        # Inferencia
-        recognition_result = self.recognizer.recognize(mp_image)
+        if result.hand_landmarks:
+            h, w, _ = result_frame.shape
+            for i, landmarks in enumerate(result.hand_landmarks):
+                self._draw_hand(result_frame, landmarks)
 
-        if recognition_result.hand_landmarks:
-            for i, hand_landmarks in enumerate(recognition_result.hand_landmarks):
-                # A) Dibujar el esqueleto
-                hand_landmarks_proto = self.landmark_pb2.NormalizedLandmarkList()
-                hand_landmarks_proto.landmark.extend([
-                    self.landmark_pb2.NormalizedLandmark(x=lm.x, y=lm.y, z=lm.z) for lm in hand_landmarks
-                ])
-
-                self.mp_drawing.draw_landmarks(
-                    result_frame,
-                    hand_landmarks_proto,
-                    self.mp_hands.HAND_CONNECTIONS,
-                    self.mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=3),
-                    self.mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2, circle_radius=2)
+                gesture_name = (
+                    result.gestures[i][0].category_name
+                    if result.gestures and i < len(result.gestures)
+                    else "Unknown"
                 )
-
-                # B) Calcular la hitbox (bounding box)
-                h, w, _ = result_frame.shape
-                x_coords = [int(lm.x * w) for lm in hand_landmarks]
-                y_coords = [int(lm.y * h) for lm in hand_landmarks]
-
-                x_min, x_max = min(x_coords), max(x_coords)
-                y_min, y_max = min(y_coords), max(y_coords)
-
-                cv2.rectangle(result_frame, (x_min - 20, y_min - 20), (x_max + 20, y_max + 20), (0, 255, 255), 2)
-
-                # C) Obtener el gesto y escribir el texto
-                gesture_name = recognition_result.gestures[i][0].category_name
-                
-                if gesture_name != "None":
-                    cv2.putText(result_frame, gesture_name, (x_min - 20, y_min - 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2, cv2.LINE_AA)
+                if gesture_name and gesture_name != "None":
                     detected_gestures.append(gesture_name)
+                    xs = [int(lm.x * w) for lm in landmarks]
+                    ys = [int(lm.y * h) for lm in landmarks]
+                    cv2.putText(
+                        result_frame, gesture_name,
+                        (max(0, min(xs) - 20), max(30, min(ys) - 30)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2, cv2.LINE_AA,
+                    )
 
         return result_frame, detected_gestures

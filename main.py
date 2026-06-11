@@ -243,7 +243,14 @@ class StereoInteractiveApp:
     def _mode_gestures(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
         # Modo 4: reconocimiento de gestos con MediaPipe (iniciado bajo demanda)
         if self.gesture is None:
-            self.gesture = GestureRecognizer()
+            try:
+                self.gesture = GestureRecognizer()
+            except ImportError as exc:
+                warning = self._draw_header(frame_left, str(exc))
+                cv2.imshow(self.window_left, warning)
+                cv2.imshow(self.window_right, self._draw_header(frame_right, "Activa el .venv donde tengas mediapipe instalado"))
+                cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
+                return
 
         rect_left, rect_right = self.stereo.rectify(frame_left, frame_right)
         left_view, left_gestures = self.gesture.process_frame(rect_left)
