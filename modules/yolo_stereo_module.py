@@ -156,45 +156,6 @@ class YoloSegBoxModule:
 
         return detections
 
-    def _draw_detections(
-        self,
-        frame: np.ndarray,
-        detections: list[dict[str, Any]],
-        disparity: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-        out = frame.copy()
-        enriched: list[dict[str, Any]] = []
-
-        for detection in detections:
-            x1, y1, x2, y2 = detection["bbox"]
-            center = detection.get("center")
-            if center is None or len(center) != 2:
-                center = self._bbox_center(detection["bbox"])
-                print("[YOLO] Fallback a centroide de bbox en _draw_detections: center ausente o invalido")
-            cx, cy = center
-            center_int = (int(round(cx)), int(round(cy)))
-
-            cv2.rectangle(out, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), (0, 255, 0), 2)
-            cv2.circle(out, center_int, 5, (0, 0, 255), -1)
-
-            label = f"{detection['class_name']} {detection['confidence']:.2f}"
-            cv2.putText(out, label, (int(round(x1)), max(20, int(round(y1)) - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(out, f"C=({center_int[0]}, {center_int[1]})", (int(round(x1)), min(out.shape[0] - 10, int(round(y2)) + 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-
-            enriched_detection = dict(detection)
-            if disparity is not None and self.stereo is not None:
-                world_point = self.stereo.get_3d_from_bbox_center(disparity, detection["bbox"])
-                enriched_detection["world"] = world_point
-                if world_point is not None:
-                    x_world, y_world, z_world = world_point
-                    depth_text = f"X={x_world:.1f} Y={y_world:.1f} Z={z_world:.1f}"
-                else:
-                    depth_text = "X/Y/Z=inv"
-                cv2.putText(out, depth_text, (int(round(x1)), min(out.shape[0] - 10, int(round(y2)) + 38)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
-            enriched.append(enriched_detection)
-
-        return out, enriched
-
     @staticmethod
     def _overlay_centroid_and_depth(
         frame: np.ndarray,
@@ -203,6 +164,7 @@ class YoloSegBoxModule:
     ) -> np.ndarray:
         out = frame.copy()
         for detection in detections:
+            # Usamos las coordenadas del bbox para saber donde posicionar las letras de las coordenadas de la máscara de segmentación
             x1, y1, x2, y2 = detection["bbox"]
             center = detection.get(center_key)
             if center is None:
@@ -616,8 +578,10 @@ class YoloSegBoxModule:
     ) -> Tuple[Any, np.ndarray, Any, np.ndarray, list[dict[str, Any]]]:
         """Ejecuta YOLO sobre el par rectificado y añade profundidad en el frame izquierdo.
 
-        El centroide se toma del bbox. La profundidad y las coordenadas 3D se
-        obtienen a partir de la disparidad calculada con `StereoTriangulator`.
+        El centroide se toma de la máscara de segmentación (`cv2.moments`), con
+        fallback al centro del bbox solo si la máscara no está disponible. La
+        profundidad y las coordenadas 3D se obtienen a partir de la disparidad
+        robusta (mediana de una ventana) calculada con `StereoTriangulator`.
         """
         if self.stereo is None:
             raise RuntimeError("Falta la instancia de StereoTriangulator para calcular profundidad.")

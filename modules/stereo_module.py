@@ -237,32 +237,76 @@ class StereoTriangulator:
         """
         return cv2.reprojectImageTo3D(disparity, self.Q, handleMissingValues=True)
 
+    def _sample_disparity_window(
+        self,
+        disparity: np.ndarray,
+        u: float,
+        v: float,
+        window: int = 5,
+    ) -> Optional[float]:
+        """Disparidad robusta en una ventana alrededor de (u,v).
+
+        En lugar de leer un único píxel (que en SGBM suele caer en un hueco o
+        en ruido), tomamos la mediana de las disparidades válidas (>0 y finitas)
+        en un cuadrado de lado `2*window+1`. Esto estabiliza tanto la profundidad
+        como la proyección del centroide a la vista derecha.
+
+        Devuelve `None` si no hay ningún valor válido en la ventana.
+        """
+        h, w = disparity.shape[:2]
+        cu = int(round(float(u)))
+        cv_ = int(round(float(v)))
+        if cu < 0 or cv_ < 0 or cu >= w or cv_ >= h:
+            return None
+
+        u0, u1 = max(0, cu - window), min(w, cu + window + 1)
+        v0, v1 = max(0, cv_ - window), min(h, cv_ + window + 1)
+        patch = disparity[v0:v1, u0:u1]
+
+        valid = patch[np.isfinite(patch) & (patch > 0.0)]
+        if valid.size == 0:
+            return None
+
+        return float(np.median(valid))
+
+    def _reproject_point(
+        self,
+        u: float,
+        v: float,
+        d: float,
+    ) -> Optional[Tuple[float, float, float]]:
+        """Convierte un único punto (u,v,disparidad) a 3D usando la matriz Q.
+
+        Equivale a lo que hace `cv2.reprojectImageTo3D` por píxel, pero sin
+        depender de que el píxel exacto tenga disparidad válida en el mapa.
+        """
+        homog = self.Q @ np.array([float(u), float(v), float(d), 1.0], dtype=np.float64)
+        if abs(homog[3]) < 1e-9:
+            return None
+
+        point = homog[:3] / homog[3]
+        if not np.all(np.isfinite(point)):
+            return None
+
+        return float(point[0]), float(point[1]), float(point[2])
+
     def get_3d_from_pixel(
         self,
         disparity: np.ndarray,
         u: int,
         v: int,
     ) -> Optional[Tuple[float, float, float]]:
-        """Obtiene la coordenada 3D (X,Y,Z) de un píxel concreto del mapa de disparidad.
+        """Obtiene la coordenada 3D (X,Y,Z) de un píxel del mapa de disparidad.
 
-        Si la disparidad en ese píxel no es válida (<=0 o NaN) devuelve `None`.
+        Usa una disparidad robusta (mediana de una ventana) y reproyecta ese
+        único punto con la matriz Q. Devuelve `None` si no hay disparidad válida
+        en la vecindad.
         """
-        h, w = disparity.shape[:2]
-        if u < 0 or v < 0 or u >= w or v >= h:
+        d = self._sample_disparity_window(disparity, u, v)
+        if d is None:
             return None
 
-        d = float(disparity[v, u])
-        if not np.isfinite(d) or d <= 0.0:
-            return None
-
-        # Reproyectar todo el mapa (puede optimizarse para puntos individuales)
-        points_3d = self.disparity_to_3d(disparity)
-        point = points_3d[v, u]
-        if not np.all(np.isfinite(point)):
-            return None
-
-        # Devolver como tupla de flotantes
-        return float(point[0]), float(point[1]), float(point[2])
+        return self._reproject_point(u, v, d)
 
     def get_3d_from_bbox_center(
         self,
@@ -312,21 +356,15 @@ class StereoTriangulator:
         disparity: np.ndarray,
         centroid: Sequence[float],
     ) -> Optional[float]:
-        """Devuelve la disparidad exacta de un centroide (u,v) en la imagen rectificada izquierda."""
+        """Devuelve la disparidad robusta de un centroide (u,v) en la imagen rectificada izquierda.
+
+        Toma la mediana de una ventana alrededor del centroide para evitar el
+        ruido y los huecos del mapa SGBM en el píxel exacto.
+        """
         if len(centroid) < 2:
             raise ValueError("El centroide debe contener al menos 2 valores: u, v")
 
-        center_u = int(round(float(centroid[0])))
-        center_v = int(round(float(centroid[1])))
-        h, w = disparity.shape[:2]
-        if center_u < 0 or center_v < 0 or center_u >= w or center_v >= h:
-            return None
-
-        value = float(disparity[center_v, center_u])
-        if not np.isfinite(value) or value <= 0.0:
-            return None
-
-        return value
+        return self._sample_disparity_window(disparity, centroid[0], centroid[1])
 
     def get_right_center_from_bbox_center(
         self,
