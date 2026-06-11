@@ -317,20 +317,33 @@ class StereoInteractiveApp:
             self.simulator.update(boxes)
 
     def _mode_yolo_and_gestures(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
+        gesture = self._ensure_gesture()
+
+        # 1) Detectar manos sobre los frames RECTIFICADOS (mismo sistema que YOLO),
+        #    sin dibujar todavia, para obtener sus hitboxes como zonas de exclusion.
+        rect_left, rect_right = self.stereo.rectify(frame_left, frame_right)
+        hands_left = gesture.detect(rect_left)
+        hands_right = gesture.detect(rect_right)
+        exclude_left = [hand["bbox"] for hand in hands_left]
+        exclude_right = [hand["bbox"] for hand in hands_right]
+
+        # 2) YOLO ignora las detecciones que caen sobre las manos.
         try:
             yolo = self._ensure_yolo()
-            _, left_view, _, right_view, detections = yolo.predict_pair_with_depth(frame_left, frame_right)
+            _, left_view, _, right_view, detections = yolo.predict_pair_with_depth(
+                frame_left, frame_right, exclude_left=exclude_left, exclude_right=exclude_right
+            )
         except (FileNotFoundError, RuntimeError) as exc:
-            left_view = self._draw_header(frame_left, str(exc))
-            right_view = self._draw_header(frame_right, "Comprueba best.pt y calibracion")
+            left_view = self._draw_header(rect_left, str(exc))
+            right_view = self._draw_header(rect_right, "Comprueba best.pt y calibracion")
             detections = []
 
         # Lanza el simulador con 5 cajas y luego actualiza sus posiciones en vivo.
         self._sync_simulator(detections)
 
-        gesture = self._ensure_gesture()
-        left_view, left_gestures = gesture.process_frame(left_view)
-        right_view, right_gestures = gesture.process_frame(right_view)
+        # 3) Dibujar los gestos encima de la imagen ya anotada por YOLO.
+        left_view, left_gestures = gesture.draw(left_view, hands_left)
+        right_view, right_gestures = gesture.draw(right_view, hands_right)
 
         left_text = "Gestos: " + (", ".join(left_gestures) if left_gestures else "ninguno")
         left_view = self._draw_header(

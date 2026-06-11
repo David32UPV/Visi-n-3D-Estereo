@@ -110,6 +110,56 @@ class YoloSegBoxModule:
         return cx, cy
 
     @staticmethod
+    def _regions_conflict(box_a: Any, box_b: Any, ratio_thr: float = 0.3) -> bool:
+        """True si dos cajas (x1,y1,x2,y2) se solapan de forma significativa.
+
+        Usamos intersección sobre el área de la caja más pequeña: si más del
+        `ratio_thr` de la menor está cubierto, se consideran en conflicto. Sirve
+        para detectar que una detección de YOLO cae sobre la mano de MediaPipe.
+        """
+        ax1, ay1, ax2, ay2 = (float(v) for v in box_a[:4])
+        bx1, by1, bx2, by2 = (float(v) for v in box_b[:4])
+
+        inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
+        inter = inter_w * inter_h
+        if inter <= 0.0:
+            return False
+
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        smaller = min(area_a, area_b)
+        if smaller <= 0.0:
+            return False
+
+        return (inter / smaller) >= ratio_thr
+
+    def _filter_result_by_exclusion(self, result: Any, exclude_bboxes: Any | None) -> Any:
+        """Devuelve un Results de YOLO sin las detecciones que solapan zonas excluidas.
+
+        `exclude_bboxes` es una lista de cajas (x1,y1,x2,y2) — típicamente las
+        hitboxes de las manos detectadas por MediaPipe. Las detecciones de YOLO
+        que caen sobre ellas se eliminan para no confundir mano con caja.
+        """
+        if not exclude_bboxes:
+            return result
+
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or len(boxes) == 0:
+            return result
+
+        xyxy = boxes.xyxy.cpu().numpy()
+        keep = [
+            index
+            for index, bbox in enumerate(xyxy)
+            if not any(self._regions_conflict(bbox, exclusion) for exclusion in exclude_bboxes)
+        ]
+
+        if len(keep) == len(xyxy):
+            return result  # nada que filtrar
+        return result[keep]
+
+    @staticmethod
     def _result_name_map(result: Any) -> dict[int, str]:
         names = getattr(result, "names", None)
         if isinstance(names, dict):
@@ -576,6 +626,8 @@ class YoloSegBoxModule:
         conf: float = 0.25,
         iou: float = 0.7,
         imgsz: int = 512,
+        exclude_left: Any | None = None,
+        exclude_right: Any | None = None,
     ) -> Tuple[Any, np.ndarray, Any, np.ndarray, list[dict[str, Any]]]:
         """Ejecuta YOLO sobre el par rectificado y añade profundidad en el frame izquierdo.
 
@@ -583,6 +635,11 @@ class YoloSegBoxModule:
         fallback al centro del bbox solo si la máscara no está disponible. La
         profundidad y las coordenadas 3D se obtienen a partir de la disparidad
         robusta (mediana de una ventana) calculada con `StereoTriangulator`.
+
+        `exclude_left`/`exclude_right` son listas opcionales de cajas (x1,y1,x2,y2)
+        en coordenadas rectificadas (p.ej. las hitboxes de las manos de MediaPipe).
+        Las detecciones de YOLO que caigan sobre ellas se descartan, evitando que
+        YOLO confunda una mano con una caja.
         """
         if self.stereo is None:
             raise RuntimeError("Falta la instancia de StereoTriangulator para calcular profundidad.")
@@ -597,7 +654,11 @@ class YoloSegBoxModule:
         left_results = active_model.predict(source=rect_left, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
         right_results = active_model.predict(source=rect_right, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
 
-        left_detections = self._extract_detections(left_results[0])
+        # Quitar las detecciones que caen sobre las manos antes de pintar y medir.
+        left_result = self._filter_result_by_exclusion(left_results[0], exclude_left)
+        right_result = self._filter_result_by_exclusion(right_results[0], exclude_right)
+
+        left_detections = self._extract_detections(left_result)
 
         # Solo calculamos las coordenadas del mundo para la imagen izquierda y proyectamos ese mismo punto al lado derecho.
         for detection in left_detections:
@@ -606,13 +667,13 @@ class YoloSegBoxModule:
             detection["right_center"] = self.stereo.get_right_center_from_centroid(disparity, centroid)
             detection["world"] = self.stereo.get_3d_from_centroid(disparity, centroid)
 
-        left_annotated = left_results[0].plot()
-        right_annotated = right_results[0].plot()
+        left_annotated = left_result.plot()
+        right_annotated = right_result.plot()
 
         left_annotated = self._overlay_centroid_and_depth(left_annotated, left_detections)
         right_annotated = self._overlay_centroid_and_depth(right_annotated, left_detections, center_key="right_center")
 
-        return left_results[0], left_annotated, right_results[0], right_annotated, left_detections
+        return left_result, left_annotated, right_result, right_annotated, left_detections
 
     def predict_pair(
         self,
