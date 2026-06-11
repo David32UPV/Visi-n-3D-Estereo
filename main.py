@@ -24,6 +24,7 @@ import numpy as np
 
 from modules.camera_module import ZEDCamera
 from modules.gesture_module import GestureRecognizer
+from modules.simulador import BinPickingSimulator
 from modules.stereo_module import StereoTriangulator
 from modules.yolo_stereo_module import YoloSegBoxModule
 
@@ -49,6 +50,9 @@ class StereoInteractiveApp:
     # Factor de escala para la ventana principal (0.5 = mitad de tamaño).
     # Cámbialo para ajustar el tamaño de visualización.
     DISPLAY_SCALE = 0.8
+
+    # Nº de cajas que debe contar YOLO para lanzar el simulador PyBullet.
+    EXPECTED_BOXES = 5
 
     @staticmethod
     def _find_recursive_path(root: Path, filename: str, preferred_parent: str | None = None) -> Optional[Path]:
@@ -98,6 +102,7 @@ class StereoInteractiveApp:
         self.stereo = StereoTriangulator(calib_path=str(calib_path), image_size=(1280, 720))
         self.gesture: Optional[GestureRecognizer] = None
         self.yolo: Optional[YoloSegBoxModule] = None
+        self.simulator = BinPickingSimulator()
         self.yolo_dataset_yaml = dataset_yaml
         self.yolo_weights = self._resolve_yolo_weights(base_dir)
         self.yolo_project_dir = self.yolo_weights.parent.parent.parent if self.yolo_weights.exists() else base_dir / "runs" / "yolo_boxes"
@@ -249,6 +254,7 @@ class StereoInteractiveApp:
         cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
 
     def _mode_yolo_boxes(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
+        detections: list = []
         try:
             yolo = self._ensure_yolo()
             _, left_view, _, right_view, detections = yolo.predict_pair_with_depth(frame_left, frame_right)
@@ -258,8 +264,57 @@ class StereoInteractiveApp:
             left_view = self._draw_header(frame_left, str(exc))
             right_view = self._draw_header(frame_right, "Comprueba best.pt y calibracion")
 
+        # Lanza el simulador con 5 cajas y luego actualiza sus posiciones en vivo.
+        self._sync_simulator(detections)
+
         self._show_stereo(left_view, right_view)
         cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
+
+    def _prepare_sim_boxes(self, detections: list) -> list:
+        """Construye la lista de cajas (clase + X/Y/Z en mm) para el simulador.
+
+        Usa la coordenada 3D ya calculada (`world`). Si alguna caja no tiene
+        profundidad válida, estima su Z con la mediana de las válidas y recupera
+        X/Y a partir del píxel del centroide y los intrínsecos de la matriz Q.
+        """
+        Q = self.stereo.Q
+        cx, cy, f = -float(Q[0, 3]), -float(Q[1, 3]), float(Q[2, 3])
+
+        valid_z = [d["world"][2] for d in detections if d.get("world") is not None]
+        fallback_z = float(np.median(valid_z)) if valid_z else 600.0
+
+        boxes = []
+        for detection in detections:
+            world = detection.get("world")
+            if world is None:
+                u, v = detection["center"]
+                z = fallback_z
+                world = (z * (u - cx) / f, z * (v - cy) / f, z)
+            boxes.append(
+                {
+                    "name": detection.get("class_name", "caja"),
+                    "world_mm": (float(world[0]), float(world[1]), float(world[2])),
+                }
+            )
+        return boxes
+
+    def _sync_simulator(self, detections: list) -> None:
+        """Lanza el simulador al contar 5 cajas y luego sigue actualizando posiciones.
+
+        - Mientras no esté lanzado: arranca PyBullet cuando hay EXPECTED_BOXES.
+        - Una vez lanzado: envía cada frame las posiciones para que las cajas del
+          simulador sigan en tiempo real a las cajas reales (movidas con la mano).
+        """
+        if not detections:
+            return
+
+        boxes = self._prepare_sim_boxes(detections)
+
+        if not self.simulator.launched:
+            if len(detections) == self.EXPECTED_BOXES and self.simulator.launch(boxes):
+                print(f"[SIM] {self.EXPECTED_BOXES} cajas detectadas -> lanzando simulador PyBullet con cobot KUKA")
+        else:
+            self.simulator.update(boxes)
 
     def _mode_yolo_and_gestures(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
         try:
@@ -269,6 +324,9 @@ class StereoInteractiveApp:
             left_view = self._draw_header(frame_left, str(exc))
             right_view = self._draw_header(frame_right, "Comprueba best.pt y calibracion")
             detections = []
+
+        # Lanza el simulador con 5 cajas y luego actualiza sus posiciones en vivo.
+        self._sync_simulator(detections)
 
         gesture = self._ensure_gesture()
         left_view, left_gestures = gesture.process_frame(left_view)

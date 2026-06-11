@@ -170,6 +170,7 @@ class YoloSegBoxModule:
             if center is None:
                 center = detection["center"]
             cx, cy = center
+            # center_int son las coordenadas de la posición del pixel en la imagen, por lo que las unidades están en pixeles no en mm
             center_int = (int(round(cx)), int(round(cy)))
 
             cv2.circle(out, center_int, 5, (0, 0, 255), -1)
