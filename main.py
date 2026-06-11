@@ -2,19 +2,16 @@
 
 Modos disponibles:
 1 - Comprobación de rectificación (dibujar líneas epipolares horizontales)
-2 - Triangulación manual por click (click izquierda -> click derecha)
+2 - Triangulación manual por click (click mitad izquierda -> click mitad derecha)
 3 - Mapa de disparidad en tiempo real (SGBM)
 4 - Reconocimiento de gestos (MediaPipe)
 5 - Detección automática de cajas con YOLOv8-seg
+6 - YOLO + Gestos simultáneos (modo por defecto)
 
 Controles:
-- Teclas 1/2/3/4/5: cambiar modo
+- Teclas 1/2/3/4/5/6: cambiar modo
 - q: salir
 - r: limpiar puntos seleccionados (modo 2)
-
-
-IMPORTANTE: cambiar lo de que al ejecutar main me salgan 2 ventanas, una por lente, 
-a que me salga una sola ventana con ambas vistas lado a lado
 """
 
 from __future__ import annotations
@@ -47,6 +44,11 @@ class StereoInteractiveApp:
     MODE_DISPARITY = 3
     MODE_GESTURES = 4
     MODE_YOLO_BOXES = 5
+    MODE_YOLO_GESTURES = 6
+
+    # Factor de escala para la ventana principal (0.5 = mitad de tamaño).
+    # Cámbialo para ajustar el tamaño de visualización.
+    DISPLAY_SCALE = 0.8
 
     @staticmethod
     def _find_recursive_path(root: Path, filename: str, preferred_parent: str | None = None) -> Optional[Path]:
@@ -101,15 +103,19 @@ class StereoInteractiveApp:
         self.yolo_project_dir = self.yolo_weights.parent.parent.parent if self.yolo_weights.exists() else base_dir / "runs" / "yolo_boxes"
 
         # Estado del modo y ventanas
-        self.mode = self.MODE_YOLO_BOXES
-        self.window_left = "ZED2 Left"
-        self.window_right = "ZED2 Right"
+        self.mode = self.MODE_YOLO_GESTURES
+        self.window_main = "ZED2 Stereo"
         self.window_aux = "ZED2 Disparity"
 
         # Variables para triangulación manual
         self.left_click: Optional[Tuple[int, int]] = None
         self.right_click: Optional[Tuple[int, int]] = None
         self.last_3d: Optional[np.ndarray] = None
+
+    def _ensure_gesture(self) -> GestureRecognizer:
+        if self.gesture is None:
+            self.gesture = GestureRecognizer()
+        return self.gesture
 
     def _ensure_yolo(self) -> YoloSegBoxModule:
         if self.yolo is None:
@@ -123,28 +129,26 @@ class StereoInteractiveApp:
         return self.yolo
 
     def _init_windows(self) -> None:
-        # Crear ventanas y asociar callbacks de ratón para seleccionar puntos
-        cv2.namedWindow(self.window_left)
-        cv2.namedWindow(self.window_right)
-        cv2.namedWindow(self.window_aux)
+        cv2.namedWindow(self.window_main, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(self.window_aux, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(self.window_main, self._on_stereo_click)
 
-        cv2.setMouseCallback(self.window_left, self._on_left_click)
-        cv2.setMouseCallback(self.window_right, self._on_right_click)
-
-    def _on_left_click(self, event: int, x: int, y: int, _flags: int, _param) -> None:
-        # Al pulsar en la ventana izquierda en modo triangulación, guardar coordenada
-        if event == cv2.EVENT_LBUTTONDOWN and self.mode == self.MODE_TRIANGULATION:
-            self.left_click = (x, y)
+    def _on_stereo_click(self, event: int, x: int, y: int, _flags: int, _param) -> None:
+        if event != cv2.EVENT_LBUTTONDOWN or self.mode != self.MODE_TRIANGULATION:
+            return
+        # Revertir la escala de visualización para obtener coordenadas en el frame original
+        s = self.DISPLAY_SCALE
+        x_orig = int(x / s)
+        y_orig = int(y / s)
+        frame_w = self.stereo.image_size[0]
+        if x_orig < frame_w:
+            self.left_click = (x_orig, y_orig)
             self.last_3d = None
-
-    def _on_right_click(self, event: int, x: int, y: int, _flags: int, _param) -> None:
-        # Al pulsar en la ventana derecha en modo triangulación, guardar y calcular 3D
-        if event == cv2.EVENT_LBUTTONDOWN and self.mode == self.MODE_TRIANGULATION:
-            self.right_click = (x, y)
+        else:
+            self.right_click = (x_orig - frame_w, y_orig)
             self._try_triangulate()
 
     def _try_triangulate(self) -> None:
-        # Si hay ambos clicks, llamar a StereoTriangulator.triangulate_points
         if self.left_click is None or self.right_click is None:
             return
 
@@ -157,7 +161,6 @@ class StereoInteractiveApp:
 
     @staticmethod
     def _draw_header(frame: np.ndarray, text: str) -> np.ndarray:
-        # Dibuja una cabecera negra con texto informativo en la parte superior
         out = frame.copy()
         cv2.rectangle(out, (0, 0), (out.shape[1], 40), (0, 0, 0), -1)
         cv2.putText(out, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
@@ -165,7 +168,6 @@ class StereoInteractiveApp:
 
     @staticmethod
     def _normalize_disparity(disparity: np.ndarray) -> np.ndarray:
-        # Escala la disparidad a 0-255 para visualización
         valid = disparity > 0
         vis = np.zeros_like(disparity, dtype=np.uint8)
         if np.any(valid):
@@ -177,32 +179,28 @@ class StereoInteractiveApp:
                 vis = scaled.astype(np.uint8)
         return vis
 
-    def _mode_raw(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
-        # Modo inicial: mostrar las imágenes tal cual llegan de la cámara
-        left_view = self._draw_header(
-            frame_left,
-            "Vista izquierda - pulsa 1 rectificar | 2 triangular | 3 disparidad | 4 gestos | 5 YOLO | q salir",
-        )
-        right_view = self._draw_header(frame_right, "Vista derecha - pulsa 1 rectificar | 2 triangular | 3 disparidad | 4 gestos | 5 YOLO | q salir")
+    def _show_stereo(self, left_view: np.ndarray, right_view: np.ndarray) -> None:
+        combined = np.hstack([left_view, right_view])
+        if self.DISPLAY_SCALE != 1.0:
+            combined = cv2.resize(combined, (0, 0), fx=self.DISPLAY_SCALE, fy=self.DISPLAY_SCALE)
+        cv2.imshow(self.window_main, combined)
 
-        cv2.imshow(self.window_left, left_view)
-        cv2.imshow(self.window_right, right_view)
+    def _mode_raw(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
+        keys_hint = "1 rectificar | 2 triangular | 3 disparidad | 4 gestos | 5 YOLO | 6 YOLO+Gestos | q salir"
+        left_view = self._draw_header(frame_left, f"Izquierda — {keys_hint}")
+        right_view = self._draw_header(frame_right, "Derecha")
+        self._show_stereo(left_view, right_view)
         cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
 
     def _mode_rectification(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
-        # Modo 1: rectificar y dibujar lineas epipolares para comprobar alineación
         rect_left, rect_right = self.stereo.rectify(frame_left, frame_right)
         epi_left, epi_right = self.stereo.draw_epilines(rect_left, rect_right)
-
-        epi_left = self._draw_header(epi_left, "Modo 1: Comprobacion rectificacion | 1/2/3/4 cambiar modo | q salir")
-        epi_right = self._draw_header(epi_right, "Las lineas horizontales deberian coincidir fila a fila")
-
-        cv2.imshow(self.window_left, epi_left)
-        cv2.imshow(self.window_right, epi_right)
+        epi_left = self._draw_header(epi_left, "Modo 1: Rectificacion | q salir")
+        epi_right = self._draw_header(epi_right, "Las lineas horizontales deben coincidir fila a fila")
+        self._show_stereo(epi_left, epi_right)
         cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
 
     def _mode_manual_triangulation(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
-        # Modo 2: Triangulación manual por selección de puntos en ambas vistas
         rect_left, rect_right = self.stereo.rectify(frame_left, frame_right)
 
         left_view = rect_left.copy()
@@ -218,15 +216,12 @@ class StereoInteractiveApp:
             cv2.putText(left_view, txt, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             cv2.putText(right_view, txt, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-        left_view = self._draw_header(left_view, "Modo 2: Click IZQ luego DER para triangular")
-        right_view = self._draw_header(right_view, "Pulsa 'r' para limpiar puntos seleccionados")
-
-        cv2.imshow(self.window_left, left_view)
-        cv2.imshow(self.window_right, right_view)
+        left_view = self._draw_header(left_view, "Modo 2: Click mitad IZQ luego DER para triangular")
+        right_view = self._draw_header(right_view, "Pulsa 'r' para limpiar puntos")
+        self._show_stereo(left_view, right_view)
         cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
 
     def _mode_disparity(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
-        # Modo 3: cálculo de disparidad densa y visualización
         rect_left, rect_right = self.stereo.rectify(frame_left, frame_right)
         disparity = self.stereo.compute_disparity(rect_left, rect_right)
 
@@ -234,23 +229,12 @@ class StereoInteractiveApp:
         disp_color = cv2.applyColorMap(disp_vis, cv2.COLORMAP_INFERNO)
 
         left_view = self._draw_header(rect_left, "Modo 3: Disparidad en tiempo real")
-        right_view = self._draw_header(rect_right, "Objetos cercanos aparecen más oscuros en la disparidad")
-
-        cv2.imshow(self.window_left, left_view)
-        cv2.imshow(self.window_right, right_view)
+        right_view = self._draw_header(rect_right, "Objetos cercanos aparecen mas oscuros")
+        self._show_stereo(left_view, right_view)
         cv2.imshow(self.window_aux, disp_color)
 
     def _mode_gestures(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
-        # Modo 4: reconocimiento de gestos con MediaPipe (iniciado bajo demanda)
-        if self.gesture is None:
-            try:
-                self.gesture = GestureRecognizer()
-            except ImportError as exc:
-                warning = self._draw_header(frame_left, str(exc))
-                cv2.imshow(self.window_left, warning)
-                cv2.imshow(self.window_right, self._draw_header(frame_right, "Activa el .venv donde tengas mediapipe instalado"))
-                cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
-                return
+        self._ensure_gesture()
 
         rect_left, rect_right = self.stereo.rectify(frame_left, frame_right)
         left_view, left_gestures = self.gesture.process_frame(rect_left)
@@ -259,34 +243,47 @@ class StereoInteractiveApp:
         left_text = "Gestos L: " + (", ".join(left_gestures) if left_gestures else "ninguno")
         right_text = "Gestos R: " + (", ".join(right_gestures) if right_gestures else "ninguno")
 
-        left_view = self._draw_header(left_view, "Modo 4: Gestos (MediaPipe)")
+        left_view = self._draw_header(left_view, f"Modo 4: Gestos (MediaPipe) | {left_text}")
         right_view = self._draw_header(right_view, right_text)
-        cv2.putText(left_view, left_text, (10, left_view.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-        cv2.imshow(self.window_left, left_view)
-        cv2.imshow(self.window_right, right_view)
+        self._show_stereo(left_view, right_view)
         cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
 
     def _mode_yolo_boxes(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
-        # Modo 5: detección automática independiente en ambas lentes
         try:
             yolo = self._ensure_yolo()
             _, left_view, _, right_view, detections = yolo.predict_pair_with_depth(frame_left, frame_right)
-
             left_view = self._draw_header(left_view, f"Modo 5: YOLO + centroide + Q | detecciones: {len(detections)}")
-            right_view = self._draw_header(right_view, "Modo 5: YOLO en lente derecha")
-
-            cv2.imshow(self.window_left, left_view)
-            cv2.imshow(self.window_right, right_view)
-            cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
+            right_view = self._draw_header(right_view, "Modo 5: YOLO lente derecha")
         except (FileNotFoundError, RuntimeError) as exc:
-            warning = self._draw_header(frame_left, str(exc))
-            cv2.imshow(self.window_left, warning)
-            cv2.imshow(self.window_right, self._draw_header(frame_right, "Activa el modo 5 cuando exista tu best.pt y la calibracion"))
-            cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
+            left_view = self._draw_header(frame_left, str(exc))
+            right_view = self._draw_header(frame_right, "Comprueba best.pt y calibracion")
+
+        self._show_stereo(left_view, right_view)
+        cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
+
+    def _mode_yolo_and_gestures(self, frame_left: np.ndarray, frame_right: np.ndarray) -> None:
+        try:
+            yolo = self._ensure_yolo()
+            _, left_view, _, right_view, detections = yolo.predict_pair_with_depth(frame_left, frame_right)
+        except (FileNotFoundError, RuntimeError) as exc:
+            left_view = self._draw_header(frame_left, str(exc))
+            right_view = self._draw_header(frame_right, "Comprueba best.pt y calibracion")
+            detections = []
+
+        gesture = self._ensure_gesture()
+        left_view, left_gestures = gesture.process_frame(left_view)
+        right_view, right_gestures = gesture.process_frame(right_view)
+
+        left_text = "Gestos: " + (", ".join(left_gestures) if left_gestures else "ninguno")
+        left_view = self._draw_header(
+            left_view,
+            f"Modo 6: YOLO+Gestos | cajas: {len(detections)} | {left_text}",
+        )
+        right_view = self._draw_header(right_view, "Modo 6: YOLO+Gestos lente derecha")
+        self._show_stereo(left_view, right_view)
+        cv2.imshow(self.window_aux, np.zeros((400, 600), dtype=np.uint8))
 
     def run(self) -> None:
-        # Abrir la cámara y comenzar el bucle principal
         if not self.camera.open():
             raise RuntimeError(
                 "No se pudo abrir la cámara ZED2. "
@@ -294,21 +291,20 @@ class StereoInteractiveApp:
             )
 
         self._init_windows()
+        self._ensure_gesture()
         self._ensure_yolo()
         print(
-            "Aplicacion estereo iniciada. Arranque automatico en modo YOLO. Teclas: 1 Rectificar | "
-            "2 Triangular | 3 Disparidad | 4 Gestos | 5 YOLO | q Salir"
+            "Aplicacion estereo iniciada. Arranque automatico en modo YOLO+Gestos. "
+            "Teclas: 1 Rectificar | 2 Triangular | 3 Disparidad | 4 Gestos | 5 YOLO | 6 YOLO+Gestos | q Salir"
         )
 
         try:
             while True:
-                # Esperar a que haya un nuevo frame disponible
                 if not self.camera.grab():
                     continue
 
                 frame_left, frame_right = self.camera.get_frames()
 
-                # Renderizar según el modo activo
                 if self.mode == self.MODE_RAW:
                     self._mode_raw(frame_left, frame_right)
                 elif self.mode == self.MODE_RECTIFICATION:
@@ -321,12 +317,13 @@ class StereoInteractiveApp:
                     self._mode_gestures(frame_left, frame_right)
                 elif self.mode == self.MODE_YOLO_BOXES:
                     self._mode_yolo_boxes(frame_left, frame_right)
+                elif self.mode == self.MODE_YOLO_GESTURES:
+                    self._mode_yolo_and_gestures(frame_left, frame_right)
 
-                # Procesar tecla
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
-                if key == ord("1"):
+                elif key == ord("1"):
                     self.mode = self.MODE_RECTIFICATION
                 elif key == ord("2"):
                     self.mode = self.MODE_TRIANGULATION
@@ -336,8 +333,9 @@ class StereoInteractiveApp:
                     self.mode = self.MODE_GESTURES
                 elif key == ord("5"):
                     self.mode = self.MODE_YOLO_BOXES
+                elif key == ord("6"):
+                    self.mode = self.MODE_YOLO_GESTURES
                 elif key == ord("r") and self.mode == self.MODE_TRIANGULATION:
-                    # Limpiar selección de puntos en modo triangulación
                     self.left_click = None
                     self.right_click = None
                     self.last_3d = None
