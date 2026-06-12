@@ -69,8 +69,14 @@ BOX_MASS = 0.0
 
 # --- Bin picking (se activa al detectar la palma abierta) ---
 EE_LINK_INDEX = 6            # último link del KUKA iiwa (efector final)
-DROP_CENTER = (0.25, -0.3)   # zona de descarga, más cerca del robot que las cajas
-DROP_SPACING = 0.15          # separación entre cajas ya descargadas (m)
+# Zona de descarga al LATERAL DERECHO del robot (Y negativa = derecha del cobot,
+# que mira hacia +X) y algo más apartada, en vez de justo enfrente. Las cajas se
+# apilan en COLUMNA: se alinean a lo largo de la profundidad (eje X), una detrás
+# de otra alejándose del robot, en lugar de en fila lateral (eje Y).
+# Si en tu vista la descarga sale al lado izquierdo, pon la Y de DROP_CENTER en
+# positivo. Distancias dentro del alcance del KUKA.
+DROP_CENTER = (0.12, -0.4)   # (x, y) en metros: 1ª caja de la columna (lateral derecho)
+DROP_SPACING = 0.10          # separación entre cajas ya descargadas (m)
 APPROACH_HEIGHT = 0.18       # altura sobre la caja para aproximar/levantar (m)
 GRAB_Z_OFFSET = 0.02         # la caja cuelga un poco por debajo del efector (m)
 REACH_TOL = 0.05             # distancia para dar un waypoint por alcanzado (m)
@@ -260,7 +266,9 @@ class _BinPickingController:
         return np.array(state[4], dtype=np.float64)
 
     def _drop_xy(self, index: int) -> tuple[float, float]:
-        return (DROP_CENTER[0], DROP_CENTER[1] + index * DROP_SPACING)
+        # Columna vertical: las cajas se alinean en profundidad (eje X),
+        # alejándose del robot; el lateral (Y) se mantiene fijo.
+        return (DROP_CENTER[0] + index * DROP_SPACING, DROP_CENTER[1])
 
     def _plan_box(self, p: Any, body: int, drop_index: int) -> list:
         pos, _ = p.getBasePositionAndOrientation(body)
