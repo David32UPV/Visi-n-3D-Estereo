@@ -242,13 +242,13 @@ class StereoTriangulator:
         disparity: np.ndarray,
         u: float,
         v: float,
-        window: int = 5,
+        window: int = 9,
     ) -> Optional[float]:
         """Disparidad robusta en una ventana alrededor de (u,v).
 
         En lugar de leer un único píxel (que en SGBM suele caer en un hueco o
-        en ruido), tomamos la mediana de las disparidades válidas (>0 y finitas)
-        en un cuadrado de lado `2*window+1`. Esto estabiliza tanto la profundidad
+            en ruido), tomamos la mediana de las disparidades válidas (>0 y finitas)
+            en un cuadrado de lado `2*window+1`. Esto estabiliza tanto la profundidad
         como la proyección del centroide a la vista derecha.
 
         Devuelve `None` si no hay ningún valor válido en la ventana.

@@ -76,6 +76,20 @@ GRAB_Z_OFFSET = 0.02         # la caja cuelga un poco por debajo del efector (m)
 REACH_TOL = 0.05             # distancia para dar un waypoint por alcanzado (m)
 MAX_STEPS_PER_WAYPOINT = 400 # tope de seguridad por waypoint (~1.7 s a 240 Hz)
 
+# Pausas explícitas del robot. La idea es que SOLO se pare exactamente 1 s en
+# cuatro momentos (prepick, pick, preplace y place) y que el resto de
+# transiciones sean sin dwell. El bucle de simulación corre a 240 Hz.
+SIM_HZ = 240.0
+PAUSE_TICKS = int(round(1.0 * SIM_HZ))  # 1 segundo de pausa
+# Detección de "asentado": en vez de esperar el timeout completo en cada
+# waypoint (lo que metía ~1.7 s muertos por punto, y el doble cuando dos
+# waypoints compartían posición), damos el movimiento por terminado en cuanto el
+# efector llega a la tolerancia O deja de acercarse (se queda parado). Así las
+# transiciones sin pausa son inmediatas.
+STALL_EPS = 0.0015   # m: movimiento del efector por tick por debajo del cual lo
+                     # consideramos parado
+STALL_TICKS = 30     # ticks parado seguidos para dar el waypoint por asentado
+
 # Límites articulares, rangos y pose de reposo del KUKA iiwa (7 ejes). Se pasan
 # a la cinemática inversa para obtener soluciones estables y alcanzables (modo
 # null-space) en vez de configuraciones extrañas que no llegan al objetivo.
@@ -182,29 +196,47 @@ def _apply_updates(p: Any, boxes: Sequence[dict], body_by_class: dict, ref_xy: S
         p.resetBasePositionAndOrientation(body, [x, y, z], [0.0, 0.0, 0.0, 1.0])
 
 
-def _ordered_body_ids(body_by_class: dict, boxes: Sequence[dict]) -> list:
-    """Ids de las cajas ordenadas por Z (profundidad al centroide) ascendente.
+def _ordered_body_ids(p: Any, body_by_class: dict) -> list:
+    """Ids de TODAS las cajas de la escena, de la más cercana al robot a la más lejana.
 
-    El robot coge primero la caja con menor Z (más cercana) y termina con la de
-    mayor Z (más lejana), tal y como se pide.
+    Se ordena por la X de simulación (que codifica la profundidad/Z de la cámara:
+    menor X = caja más cercana al robot = caja más cercana a la cámara), usando la
+    posición ACTUAL de cada caja en PyBullet.
+
+    Clave del arreglo: tomamos las cajas presentes en la escena
+    (`body_by_class`), NO las de la última detección de YOLO. Al enseñar la palma
+    abierta la mano suele ocultar o excluir varias cajas, así que el último frame
+    de YOLO puede traer solo 1-2 cajas; si nos basáramos en él, el robot solo haría
+    el pick&place de esas. Usando la escena completa siempre intenta las 5.
     """
-    ordered = sorted(boxes, key=lambda b: float(b["world_mm"][2]))
-    body_ids = [body_by_class.get(b.get("name", "caja")) for b in ordered]
-    return [body for body in body_ids if body is not None]
+    bodies = [body for body in body_by_class.values() if body is not None]
+
+    def _forward(body: int) -> float:
+        pos, _ = p.getBasePositionAndOrientation(body)
+        return float(pos[0])  # X simulación = profundidad de la cámara
+
+    return sorted(bodies, key=_forward)
 
 
 class _BinPickingController:
     """Máquina de estados que mueve el KUKA para hacer pick&place de las cajas.
 
     Recorre las cajas en el orden dado (por Z ascendente). Para cada una sigue
-    una secuencia de waypoints: aproximar por encima, bajar, agarrar, levantar,
-    transportar a la zona de descarga, bajar, soltar y retirarse. Mientras la
+    una secuencia de waypoints: aproximar por encima, bajar+agarrar, levantar,
+    transportar a la zona de descarga, bajar+soltar y retirarse. Mientras la
     caja está "agarrada", su posición sigue al efector final (agarre cinemático).
+
+    El robot solo se detiene exactamente 1 s en cuatro puntos (prepick, pick,
+    preplace y place); el resto de movimientos encadenan sin esperas. Cada
+    movimiento se da por terminado en cuanto el efector llega o deja de acercarse
+    al objetivo, sin agotar el timeout, para que no haya delays sobrantes.
     """
 
     def __init__(self, robot_id: int, ordered_bodies: Sequence[int]) -> None:
         self.robot = robot_id
         self.pending = list(ordered_bodies)
+        self.total = len(self.pending)   # cajas que se deben colocar (objetivo)
+        self.placed = 0                  # cajas ya descargadas con éxito
         self.box_z = float(BOX_HALF_EXTENTS[2])
         self.current: Optional[int] = None
         self.waypoints: list = []
@@ -213,6 +245,15 @@ class _BinPickingController:
         self.drop_index = 0
         self.done = False
         self._down_orn: Optional[Sequence[float]] = None
+        # Estado de la caja agarrada (persistente: la caja sigue al efector
+        # mientras esté True; se alterna "al llegar" al waypoint de pick/place).
+        self.grabbed = False
+        # Sub-estado del waypoint actual: "moving" (yendo al objetivo) u
+        # "holding" (parado la pausa de 1 s). Y detección de parada del efector.
+        self.phase = "moving"
+        self.hold_left = 0
+        self._stall = 0
+        self._last_ee: Optional[np.ndarray] = None
 
     def _ee_pos(self, p: Any) -> np.ndarray:
         state = p.getLinkState(self.robot, EE_LINK_INDEX, computeForwardKinematics=True)
@@ -229,16 +270,19 @@ class _BinPickingController:
         dx, dy = self._drop_xy(drop_index)
         above_drop = [dx, dy, self.box_z + APPROACH_HEIGHT]
         at_drop = [dx, dy, self.box_z + GRAB_Z_OFFSET]
-        # (objetivo_efector, caja_agarrada)
+        # (objetivo_efector, grab_al_llegar, pausa_en_ticks)
+        #   grab_al_llegar: True -> agarra la caja al asentarse en el waypoint,
+        #                   False -> la suelta, None -> no cambia el agarre.
+        # No hay dos waypoints consecutivos en la misma posición: el agarre y el
+        # soltado ocurren "al llegar" a un único waypoint de bajada, así no se
+        # duplica el tiempo de espera. Solo estos cuatro puntos tienen pausa de 1 s.
         return [
-            (above_box, False),   # aproximar por encima
-            (at_box, False),      # bajar a la caja
-            (at_box, True),       # agarrar
-            (above_box, True),    # levantar
-            (above_drop, True),   # transportar sobre la descarga
-            (at_drop, True),      # bajar a soltar
-            (at_drop, False),     # soltar
-            (above_drop, False),  # retirarse
+            (above_box, None, PAUSE_TICKS),    # prepick: llega y espera 1 s antes de bajar
+            (at_box, True, PAUSE_TICKS),       # PICK: baja, agarra y espera 1 s
+            (above_box, None, 0),              # levanta (sin pausa)
+            (above_drop, None, PAUSE_TICKS),   # preplace: llega y espera 1 s antes de bajar
+            (at_drop, False, PAUSE_TICKS),     # PLACE: baja, suelta y espera 1 s
+            (above_drop, None, 0),             # se retira (sin pausa)
         ]
 
     def _send_ik(self, p: Any, target: Sequence[float]) -> None:
@@ -253,6 +297,19 @@ class _BinPickingController:
                 self.robot, j, p.POSITION_CONTROL,
                 targetPosition=joints[j], force=300.0, maxVelocity=3.0,
             )
+
+    def _follow_ee(self, p: Any, ee: np.ndarray) -> None:
+        """La caja agarrada cuelga del efector final (agarre cinemático)."""
+        p.resetBasePositionAndOrientation(
+            self.current,
+            [float(ee[0]), float(ee[1]), max(self.box_z, float(ee[2]) - GRAB_Z_OFFSET)],
+            [0.0, 0.0, 0.0, 1.0],
+        )
+
+    def _rest_at_drop(self, p: Any) -> None:
+        """Apoya la caja actual en su hueco de la zona de descarga, sobre el suelo."""
+        dx, dy = self._drop_xy(self.drop_index - 1)
+        p.resetBasePositionAndOrientation(self.current, [dx, dy, self.box_z], [0.0, 0.0, 0.0, 1.0])
 
     def step(self, p: Any) -> None:
         """Avanza la rutina un tick de simulación."""
@@ -271,29 +328,52 @@ class _BinPickingController:
             self.drop_index += 1
             self.wp_index = 0
             self.steps = 0
+            self.phase = "moving"
+            self.hold_left = 0
+            self._stall = 0
+            self._last_ee = self._ee_pos(p)
+            self.grabbed = False  # cada caja arranca sin agarrar
 
-        target, grabbed = self.waypoints[self.wp_index]
+        target, grab_after, pause_ticks = self.waypoints[self.wp_index]
         self._send_ik(p, target)
 
-        # Si la caja está agarrada, que siga al efector final.
-        if grabbed:
-            ee = self._ee_pos(p)
-            p.resetBasePositionAndOrientation(
-                self.current,
-                [float(ee[0]), float(ee[1]), max(self.box_z, float(ee[2]) - GRAB_Z_OFFSET)],
-                [0.0, 0.0, 0.0, 1.0],
-            )
+        ee = self._ee_pos(p)
+        # Mientras la caja esté agarrada, sigue al efector (también durante la pausa).
+        if self.grabbed:
+            self._follow_ee(p, ee)
 
-        self.steps += 1
-        reached = np.linalg.norm(self._ee_pos(p) - np.asarray(target, dtype=np.float64)) < REACH_TOL
-        if reached or self.steps > MAX_STEPS_PER_WAYPOINT:
-            self.wp_index += 1
-            self.steps = 0
-            if self.wp_index >= len(self.waypoints):
-                # Caja terminada: dejarla bien apoyada en su sitio de descarga.
-                dx, dy = self._drop_xy(self.drop_index - 1)
-                p.resetBasePositionAndOrientation(self.current, [dx, dy, self.box_z], [0.0, 0.0, 0.0, 1.0])
-                self.current = None
+        if self.phase == "moving":
+            self.steps += 1
+            # ¿Se ha quedado parado el efector (no se acerca más al objetivo)?
+            move = float(np.linalg.norm(ee - self._last_ee)) if self._last_ee is not None else 0.0
+            self._stall = self._stall + 1 if move < STALL_EPS else 0
+            self._last_ee = ee
+
+            reached = float(np.linalg.norm(ee - np.asarray(target, dtype=np.float64))) < REACH_TOL
+            settled = reached or self._stall >= STALL_TICKS or self.steps > MAX_STEPS_PER_WAYPOINT
+            if settled:
+                # Agarre/soltado "al llegar" al waypoint.
+                if grab_after is True:
+                    self.grabbed = True
+                elif grab_after is False:
+                    self.grabbed = False
+                    self._rest_at_drop(p)  # la caja se queda apoyada al soltarla
+                self.phase = "holding"
+                self.hold_left = pause_ticks
+        else:  # holding: parado exactamente `pause_ticks` ticks (1 s o 0)
+            if self.hold_left > 0:
+                self.hold_left -= 1
+            else:
+                self.wp_index += 1
+                self.phase = "moving"
+                self.steps = 0
+                self._stall = 0
+                self._last_ee = ee
+                if self.wp_index >= len(self.waypoints):
+                    # Caja terminada: dejarla bien apoyada en su sitio de descarga.
+                    self._rest_at_drop(p)
+                    self.placed += 1
+                    self.current = None
 
 
 def _run_scene(boxes: Sequence[dict], update_queue: Any = None, gui: bool = True) -> None:
@@ -311,6 +391,7 @@ def _run_scene(boxes: Sequence[dict], update_queue: Any = None, gui: bool = True
         body_by_class, ref_xy, robot_id = _populate_scene(p, boxes)
         last_boxes = list(boxes)
         controller: Optional[_BinPickingController] = None
+        pick_done_logged = False
 
         if not gui:
             for _ in range(10):
@@ -342,19 +423,34 @@ def _run_scene(boxes: Sequence[dict], update_queue: Any = None, gui: bool = True
                 if controller is None:
                     _apply_updates(p, latest_update, body_by_class, ref_xy)
 
-            # Palma abierta -> arrancar el bin picking (una sola vez).
-            if pick_requested and controller is None and last_boxes:
-                ordered = _ordered_body_ids(body_by_class, last_boxes)
+            # Palma abierta -> arrancar el bin picking (una sola vez). Se cogen
+            # TODAS las cajas de la escena, no solo las de la última detección.
+            if pick_requested and controller is None:
+                ordered = _ordered_body_ids(p, body_by_class)
                 if ordered:
                     controller = _BinPickingController(robot_id, ordered)
-                    print("[SIM] Palma abierta -> bin picking por Z ascendente (cercana -> lejana)")
+                    print(f"[SIM] Palma abierta -> bin picking de {len(ordered)} cajas (cercana -> lejana)")
+                else:
+                    print("[SIM][ERROR] Palma abierta pero no hay cajas en la escena: no se puede hacer pick and place.")
 
             if controller is not None and not controller.done:
                 try:
                     controller.step(p)
                 except Exception as exc:  # noqa: BLE001 - no queremos cerrar la escena
-                    print("[SIM] Error en bin picking, se detiene la rutina:", exc)
+                    print("[SIM][ERROR] Excepción en bin picking, se detiene la rutina:", exc)
                     controller.done = True
+
+                # Al terminar la rutina, confirmar que se han colocado las 5 cajas.
+                if controller.done and not pick_done_logged:
+                    pick_done_logged = True
+                    if controller.placed >= controller.total:
+                        print(f"[SIM] Bin picking completado: {controller.placed}/{controller.total} cajas colocadas.")
+                    else:
+                        print(
+                            f"[SIM][ERROR] Bin picking incompleto: solo {controller.placed}/{controller.total} "
+                            "cajas colocadas. El robot no terminó el pick and place de las 5 cajas "
+                            "(revisa alcance/IK del KUKA o las posiciones de las cajas)."
+                        )
 
             p.stepSimulation()
             time.sleep(1.0 / 240.0)
