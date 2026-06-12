@@ -202,26 +202,29 @@ def _apply_updates(p: Any, boxes: Sequence[dict], body_by_class: dict, ref_xy: S
         p.resetBasePositionAndOrientation(body, [x, y, z], [0.0, 0.0, 0.0, 1.0])
 
 
-def _ordered_body_ids(p: Any, body_by_class: dict) -> list:
-    """Ids de TODAS las cajas de la escena, de la más cercana al robot a la más lejana.
+def _ordered_body_ids(body_by_class: dict, z_by_class: dict) -> list:
+    """Ids de TODAS las cajas de la escena, ordenadas por la Z (mm) del centroide.
 
-    Se ordena por la X de simulación (que codifica la profundidad/Z de la cámara:
-    menor X = caja más cercana al robot = caja más cercana a la cámara), usando la
-    posición ACTUAL de cada caja en PyBullet.
+    Lee directamente la Z en mm que guardamos de cada caja: la distancia desde el
+    centro óptico de la lente izquierda de la ZED2 hasta el centroide de su
+    máscara YOLOv8-seg (la misma Z que se muestra en pantalla como `Z=...`). El
+    robot coge primero la caja con MENOR Z (la más cercana a la cámara) y termina
+    con la de mayor Z (la más lejana). Así evitamos depender de la posición
+    transformada/escalada en el simulador, que a veces invertía el orden.
 
-    Clave del arreglo: tomamos las cajas presentes en la escena
-    (`body_by_class`), NO las de la última detección de YOLO. Al enseñar la palma
-    abierta la mano suele ocultar o excluir varias cajas, así que el último frame
-    de YOLO puede traer solo 1-2 cajas; si nos basáramos en él, el robot solo haría
-    el pick&place de esas. Usando la escena completa siempre intenta las 5.
+    Se ordenan TODAS las cajas de la escena (`body_by_class`), no solo las de la
+    última detección: al enseñar la palma la mano puede ocultar alguna caja, así
+    que usamos la última Z conocida de cada clase (`z_by_class`), que se actualiza
+    frame a frame. Una clase sin Z conocida se manda al final.
     """
-    bodies = [body for body in body_by_class.values() if body is not None]
+    named = [(name, body) for name, body in body_by_class.items() if body is not None]
 
-    def _forward(body: int) -> float:
-        pos, _ = p.getBasePositionAndOrientation(body)
-        return float(pos[0])  # X simulación = profundidad de la cámara
+    def _z(name: str) -> float:
+        z = z_by_class.get(name)
+        return float(z) if z is not None else float("inf")
 
-    return sorted(bodies, key=_forward)
+    named.sort(key=lambda nb: _z(nb[0]))
+    return [body for _, body in named]
 
 
 class _BinPickingController:
@@ -433,6 +436,13 @@ def _run_scene(boxes: Sequence[dict], update_queue: Any = None, pause_event: Any
     try:
         body_by_class, ref_xy, robot_id = _populate_scene(p, boxes)
         last_boxes = list(boxes)
+        # Última Z (mm) conocida de cada clase: distancia de la lente izquierda al
+        # centroide de la máscara YOLOv8-seg. Se actualiza con cada detección y
+        # sirve para que el robot coja primero la caja más cercana (menor Z).
+        z_by_class = {
+            b.get("name", "caja"): float(b["world_mm"][2])
+            for b in boxes if b.get("world_mm") is not None
+        }
         controller: Optional[_BinPickingController] = None
         pick_done_logged = False
         paused = False
@@ -484,6 +494,12 @@ def _run_scene(boxes: Sequence[dict], update_queue: Any = None, pause_event: Any
 
             if latest_update:
                 last_boxes = latest_update
+                # Guardar la última Z (mm) del centroide de cada caja detectada,
+                # para ordenar el pick por cercanía aunque la palma oculte alguna.
+                for b in latest_update:
+                    wm = b.get("world_mm")
+                    if wm is not None:
+                        z_by_class[b.get("name", "caja")] = float(wm[2])
                 # Mientras el robot no esté trabajando, las cajas siguen a la ZED.
                 if controller is None:
                     _apply_updates(p, latest_update, body_by_class, ref_xy)
@@ -491,10 +507,10 @@ def _run_scene(boxes: Sequence[dict], update_queue: Any = None, pause_event: Any
             # Palma abierta -> arrancar el bin picking (una sola vez). Se cogen
             # TODAS las cajas de la escena, no solo las de la última detección.
             if pick_requested and controller is None:
-                ordered = _ordered_body_ids(p, body_by_class)
+                ordered = _ordered_body_ids(body_by_class, z_by_class)
                 if ordered:
                     controller = _BinPickingController(robot_id, ordered)
-                    print(f"[SIM] Palma abierta -> bin picking de {len(ordered)} cajas (cercana -> lejana)")
+                    print(f"[SIM] Palma abierta -> bin picking de {len(ordered)} cajas (menor Z -> mayor Z)")
                 else:
                     print("[SIM][ERROR] Palma abierta pero no hay cajas en la escena: no se puede hacer pick and place.")
 
