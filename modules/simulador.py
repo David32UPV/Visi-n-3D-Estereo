@@ -250,6 +250,7 @@ class _BinPickingController:
         self.steps = 0
         self.drop_index = 0
         self.done = False
+        self.homing = False              # True mientras vuelve a la pose de inicio
         self._down_orn: Optional[Sequence[float]] = None
         # Estado de la caja agarrada (persistente: la caja sigue al efector
         # mientras esté True; se alterna "al llegar" al waypoint de pick/place).
@@ -319,6 +320,33 @@ class _BinPickingController:
         dx, dy = self._drop_xy(self.drop_index - 1)
         p.resetBasePositionAndOrientation(self.current, [dx, dy, self.box_z], [0.0, 0.0, 0.0, 1.0])
 
+    def _send_home(self, p: Any) -> None:
+        """Comanda las articulaciones a la pose de reposo inicial del KUKA."""
+        for j, angle in enumerate(KUKA_REST_POSES):
+            p.setJointMotorControl2(
+                self.robot, j, p.POSITION_CONTROL,
+                targetPosition=angle, force=300.0, maxVelocity=3.0,
+            )
+
+    def _return_home(self, p: Any) -> None:
+        """Tras colocar todas las cajas, vuelve a la pose de inicio y termina."""
+        if not self.homing:
+            self.homing = True
+            self.steps = 0
+            self._stall = 0
+            self._last_ee = self._ee_pos(p)
+            print("[SIM] Bin picking terminado -> volviendo a la pose de inicio.")
+        self._send_home(p)
+        ee = self._ee_pos(p)
+        self.steps += 1
+        move = float(np.linalg.norm(ee - self._last_ee)) if self._last_ee is not None else 0.0
+        self._stall = self._stall + 1 if move < STALL_EPS else 0
+        self._last_ee = ee
+        # Termina al llegar a reposo (efector parado) o por seguridad por tiempo.
+        if self._stall >= STALL_TICKS or self.steps > MAX_STEPS_PER_WAYPOINT:
+            self.done = True
+            print("[SIM] Robot de vuelta en la pose de inicio.")
+
     def step(self, p: Any) -> None:
         """Avanza la rutina un tick de simulación."""
         if self.done:
@@ -329,7 +357,8 @@ class _BinPickingController:
         # ¿Empezar con la siguiente caja?
         if self.current is None:
             if not self.pending:
-                self.done = True
+                # No quedan cajas: volver a la pose de inicio antes de terminar.
+                self._return_home(p)
                 return
             self.current = self.pending.pop(0)
             self.waypoints = self._plan_box(p, self.current, self.drop_index)
@@ -384,12 +413,18 @@ class _BinPickingController:
                     self.current = None
 
 
-def _run_scene(boxes: Sequence[dict], update_queue: Any = None, gui: bool = True) -> None:
+def _run_scene(boxes: Sequence[dict], update_queue: Any = None, pause_event: Any = None,
+               gui: bool = True) -> None:
     """Punto de entrada del proceso hijo: abre PyBullet y mantiene la escena viva.
 
     Mientras la ventana esté abierta, drena `update_queue` y reposiciona las
     cajas con la última actualización disponible. Con `gui=False` (para tests)
     construye la escena en DIRECT, da unos pasos y cierra.
+
+    `pause_event` controla la pausa/reanudación con gestos: si está activado
+    (puño cerrado) la simulación se congela en el sitio (no se avanza la física
+    y el robot se queda exactamente donde esté); al desactivarse (palma abierta)
+    se reanuda desde ese mismo punto, conservando el estado del bin picking.
     """
     import pybullet as p
 
@@ -400,6 +435,7 @@ def _run_scene(boxes: Sequence[dict], update_queue: Any = None, gui: bool = True
         last_boxes = list(boxes)
         controller: Optional[_BinPickingController] = None
         pick_done_logged = False
+        paused = False
 
         if not gui:
             for _ in range(10):
@@ -410,6 +446,27 @@ def _run_scene(boxes: Sequence[dict], update_queue: Any = None, gui: bool = True
 
         print(f"[SIM] Escena lista con {len(boxes)} cajas y cobot KUKA. Cierra la ventana para terminar.")
         while p.isConnected():
+            # Pausa/reanudación con gestos: puño cerrado congela la simulación
+            # donde esté el robot; palma abierta la reanuda desde ese mismo punto.
+            if pause_event is not None and pause_event.is_set():
+                if not paused:
+                    paused = True
+                    # Congelar el robot exactamente donde esté (cualquier pose).
+                    for j in range(p.getNumJoints(robot_id)):
+                        pos_j = p.getJointState(robot_id, j)[0]
+                        p.resetJointState(robot_id, j, pos_j)  # velocidad a cero
+                        p.setJointMotorControl2(
+                            robot_id, j, p.POSITION_CONTROL,
+                            targetPosition=pos_j, force=300.0,  # mantiene la pose
+                        )
+                    print("[SIM] STOP (puño cerrado) -> simulación EN PAUSA. Abre la palma para reanudar.")
+                time.sleep(1.0 / 240.0)
+                continue
+            elif paused:
+                # El evento se ha desactivado (palma abierta) -> reanudar.
+                paused = False
+                print("[SIM] Palma abierta -> simulación REANUDADA desde donde se paró.")
+
             # Vaciar la cola: quedarnos con la última actualización y ver si se
             # ha pedido iniciar el bin picking.
             latest_update = None
@@ -474,6 +531,7 @@ class BinPickingSimulator:
         self._ctx = mp.get_context("spawn")
         self._proc: Optional[mp.process.BaseProcess] = None
         self._queue: Optional[Any] = None
+        self._pause_event: Optional[Any] = None
         self._launched = False
 
     @property
@@ -500,9 +558,13 @@ class BinPickingSimulator:
 
         # `spawn` evita heredar el estado de CUDA/ZED del proceso principal.
         self._queue = self._ctx.Queue(maxsize=2)
+        # Event aparte para la pausa: es una señal de seguridad y no puede perderse
+        # si la cola de updates está llena (la cola usa put_nowait y descarta).
+        # Activado = pausa (puño); desactivado = en marcha (palma).
+        self._pause_event = self._ctx.Event()
         self._proc = self._ctx.Process(
             target=_run_scene,
-            args=(list(boxes), self._queue),
+            args=(list(boxes), self._queue, self._pause_event),
             daemon=False,
         )
         self._proc.start()
@@ -534,6 +596,23 @@ class BinPickingSimulator:
             self._queue.put_nowait({"cmd": "pick"})
         except queue.Full:
             pass
+
+    def pause(self) -> None:
+        """Pausa la simulación (puño cerrado): el robot se congela donde esté.
+
+        Es seguro llamarlo en cada frame mientras el puño siga cerrado. Usa un
+        Event, así que la señal nunca se pierde (a diferencia de la cola).
+        """
+        if self._pause_event is not None:
+            self._pause_event.set()
+
+    def resume(self) -> None:
+        """Reanuda la simulación (palma abierta) desde donde se quedó pausada.
+
+        Es seguro llamarlo en cada frame: si no estaba en pausa no hace nada.
+        """
+        if self._pause_event is not None:
+            self._pause_event.clear()
 
     def close(self) -> None:
         """Cierra el simulador si sigue vivo (opcional)."""

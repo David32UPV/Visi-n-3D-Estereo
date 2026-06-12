@@ -345,9 +345,14 @@ class StereoInteractiveApp:
         left_view, left_gestures = gesture.draw(left_view, hands_left)
         right_view, right_gestures = gesture.draw(right_view, hands_right)
 
-        # Palma abierta -> ordenar al robot que empiece el bin picking.
+        # Palma abierta -> empezar el bin picking y, si estaba en pausa, reanudarlo.
         if self.simulator.launched and ("Open_Palm" in left_gestures or "Open_Palm" in right_gestures):
             self.simulator.start_bin_picking()
+            self.simulator.resume()
+
+        # Puño cerrado -> pausar la simulación (el robot se congela donde esté).
+        if self.simulator.launched and ("Closed_Fist" in left_gestures or "Closed_Fist" in right_gestures):
+            self.simulator.pause()
 
         left_text = "Gestos: " + (", ".join(left_gestures) if left_gestures else "ninguno")
         left_view = self._draw_header(
